@@ -21,15 +21,30 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
-use datafusion::common::Result;
+use datafusion::common::{Result, ScalarValue};
 use datafusion::datasource::source_as_provider;
 use datafusion::logical_expr::TableSource;
 use datafusion::prelude::SessionContext;
 
 use crate::store::stable_hash;
 
+/// Exact statistics of one column over all rows of one data file.
+///
+/// Only fill these when they are exact: `min`/`max` must be the true
+/// smallest/largest non-null values (or bounds no tighter than them: a
+/// smaller `min` or larger `max` is still correct, just less useful), and
+/// `null_count`/`row_count` must be exact. `min`/`max` are null when every
+/// row is null. Their type must be the column's type in the table schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStats {
+    pub min: ScalarValue,
+    pub max: ScalarValue,
+    pub null_count: u64,
+    pub row_count: u64,
+}
+
 /// One data file of a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct DataFile {
     /// The path the adapter understands (passed back to
     /// [`FileSnapshot::provider_for`]).
@@ -38,6 +53,23 @@ pub struct DataFile {
     /// contributes can change: path + size (+ etag/mtime) + any delete
     /// files / deletion vectors that apply to it.
     pub id: String,
+    /// Per-column statistics, by column name (optional: columns without
+    /// them simply never let the cache skip or reuse the file per
+    /// predicate). Derived from the content, so not part of `id`.
+    pub stats: Arc<HashMap<String, ColumnStats>>,
+}
+
+impl PartialEq for DataFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.id == other.id
+    }
+}
+impl Eq for DataFile {}
+impl std::hash::Hash for DataFile {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.path.hash(state);
+        self.id.hash(state);
+    }
 }
 
 impl DataFile {
@@ -48,7 +80,19 @@ impl DataFile {
         let name = path.rsplit('/').next().unwrap_or(&path);
         let short = &name[..name.floor_char_boundary(12)];
         let id = format!("{short}:{}", &stable_hash(&format!("{path}|{identity}"))[..16]);
-        Self { path, id }
+        Self { path, id, stats: Default::default() }
+    }
+
+    /// Attach exact statistics of `column` (see [`ColumnStats`]).
+    pub fn with_stats(mut self, column: impl Into<String>, stats: ColumnStats) -> Self {
+        Arc::make_mut(&mut self.stats).insert(column.into(), stats);
+        self
+    }
+
+    /// Attach statistics of many columns at once.
+    pub fn with_all_stats(mut self, stats: Arc<HashMap<String, ColumnStats>>) -> Self {
+        self.stats = stats;
+        self
     }
 }
 

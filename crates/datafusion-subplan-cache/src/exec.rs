@@ -36,6 +36,7 @@ use futures::{Stream, StreamExt};
 
 use crate::cache::{Cache, CacheEntry, EntryData, SegmentUse, Stored};
 use crate::rewrite::{CacheReadNode, CacheWriteNode, Rewriter, SegmentedAggregateNode, short_id};
+use crate::lift::{self, Class};
 use crate::table::{Binding, DataFile};
 
 // ---------------------------------------------------------------------------
@@ -243,9 +244,24 @@ impl CacheExtensionPlanner {
             return Ok(template);
         };
 
-        // 1. Reuse cached segments whose files are all still in the snapshot.
-        //    Larger segments first; segments never overlap within one plan.
-        let live: HashSet<String> = snap.files().iter().map(|f| snap.file_dep(f)).collect();
+        // 0. With lifted conjuncts, split the files: inside ones go through
+        //    the cached unfiltered segments, edge ones are read with the full
+        //    predicate, outside ones are not read at all.
+        let mut inside: Vec<&DataFile> = vec![];
+        let mut edge: Vec<&DataFile> = vec![];
+        let mut skipped = 0;
+        for f in snap.files() {
+            match lift::classify(f, &node.lifted) {
+                Class::Inside => inside.push(f),
+                Class::Edge => edge.push(f),
+                Class::Outside => skipped += 1,
+            }
+        }
+
+        // 1. Reuse cached segments whose files are all still in the snapshot
+        //    (and kept whole by the lifted conjuncts). Larger segments first;
+        //    segments never overlap within one plan.
+        let live: HashSet<String> = inside.iter().map(|f| snap.file_dep(f)).collect();
         let mut segments = cache.segments(&node.base_key);
         segments.sort_by_key(|e| Reverse(e.deps.len()));
         let mut covered: HashSet<String> = HashSet::new();
@@ -273,7 +289,16 @@ impl CacheExtensionPlanner {
         }
 
         // 2. Plan the partial aggregate over the remaining files, in segments.
-        let missing: Vec<&DataFile> = snap.files().iter().filter(|f| !covered.contains(&snap.file_dep(f))).collect();
+        //    Sorted by the first lifted column, so that segments hold
+        //    neighbouring values and a moving window invalidates few of them.
+        let mut missing: Vec<&DataFile> = inside.iter().copied().filter(|f| !covered.contains(&snap.file_dep(f))).collect();
+        if let Some(first) = node.lifted.first() {
+            let key = |f: &DataFile| f.stats.get(&first.column).map(|s| s.min.clone());
+            missing.sort_by(|a, b| match (key(a), key(b)) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                (x, y) => x.is_none().cmp(&y.is_none()),
+            });
+        }
         let per_segment = cache.segment_files.load(Ordering::Relaxed).max(1);
         // Segment plans are spliced into the outer plan, which is physically
         // optimized as a whole afterwards. Optimizing them here too would run
@@ -284,15 +309,16 @@ impl CacheExtensionPlanner {
                 .build(),
             None => return Ok(template),
         };
-        for chunk in missing.chunks(per_segment) {
-            let Some(provider) = snap.inner.provider_for(chunk).await? else {
+        // The partial aggregate of `plan` over just `files`, or None if that
+        // cannot be planned (then fall back to the template).
+        let restricted_partial = async |plan: &LogicalPlan, files: &[&DataFile]| -> Result<Option<Arc<dyn ExecutionPlan>>> {
+            let Some(provider) = snap.inner.provider_for(files).await? else {
                 cache.event(format!("  · {}: {} cannot scan a subset of its files, no per-segment caching", node.id, snap.name));
-                return Ok(template);
+                return Ok(None);
             };
             let source = provider_as_source(provider);
             // Replace the scans of exactly this snapshot (matched by provider).
-            let restricted = node
-                .input
+            let restricted = plan
                 .clone()
                 .transform_up(|p| match p {
                     LogicalPlan::TableScan(mut scan)
@@ -307,8 +333,25 @@ impl CacheExtensionPlanner {
             let physical = planner.create_physical_plan(&restricted, &unoptimized).await?;
             let Some(partial) = partial_aggregate(&physical) else {
                 cache.event(format!("  · {}: segment planned single-stage, no per-segment caching", node.id));
-                return Ok(template);
+                return Ok(None);
             };
+            if partial.schema() != template_partial.schema() {
+                cache.event(format!("  · {}: segment state schema differs from the query's, no per-segment caching", node.id));
+                return Ok(None);
+            }
+            Ok(Some(partial))
+        };
+
+        // Edge files: the full predicate, read live, not cached.
+        let mut edge_ids = vec![];
+        for chunk in edge.chunks(per_segment) {
+            let Some(partial) = restricted_partial(&node.input, chunk).await? else { return Ok(template) };
+            edge_ids.extend(chunk.iter().map(|f| f.id.clone()));
+            children.push(partial);
+        }
+
+        for chunk in missing.chunks(per_segment) {
+            let Some(partial) = restricted_partial(&node.windowless, chunk).await? else { return Ok(template) };
             let deps: Vec<String> = chunk.iter().map(|f| snap.file_dep(f)).collect();
             let key = format!("{}\n-- segment: {}", node.base_key, deps.join(","));
             let meta = WriteMeta {
@@ -322,7 +365,9 @@ impl CacheExtensionPlanner {
             children.push(Arc::new(CacheWriteExec::new(Arc::new(meta), partial, cache.clone())));
         }
 
-        cache.event(format!(
+        let mut lifted: Vec<String> = node.lifted.iter().map(|l| l.expr.to_string()).collect();
+        lifted.dedup(); // a BETWEEN lifts as two predicates sharing one expression
+        let mut msg = format!(
             "  ▦ segmented {} over {} v{}: {} of {} files from {} cached segment(s), {} file(s) computed in {} new segment(s)",
             node.id,
             snap.name,
@@ -332,11 +377,23 @@ impl CacheExtensionPlanner {
             reused.len(),
             missing.len(),
             computed.len()
-        ));
+        );
+        if !lifted.is_empty() {
+            msg += &format!(
+                "; lifted [{}]: {} edge file(s) read live, {} file(s) skipped",
+                lifted.join(" AND "),
+                edge.len(),
+                skipped
+            );
+        }
+        cache.event(msg);
         cache.record_segment_use(SegmentUse {
             base_key: node.base_key.clone(),
             reused,
             computed,
+            lifted,
+            edge: edge_ids,
+            skipped,
         });
         if children.is_empty() {
             return Ok(template); // empty table

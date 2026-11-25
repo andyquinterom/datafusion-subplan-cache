@@ -21,11 +21,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::arrow::datatypes::DataType;
+use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion_ducklake::inlined_filter::{InlinedDataScan, InlinedFilter};
 use datafusion_ducklake::metadata_provider::{
-    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileMetadata, DuckLakeInlinedData,
+    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics, DuckLakeFileMetadata,
+    DuckLakeInlinedData,
     DuckLakeInlinedDelete, DuckLakeNameMapping, DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableField,
     FileWithTable, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
 };
@@ -37,7 +39,7 @@ use datafusion_ducklake::{
 };
 
 use crate::store::stable_hash;
-use crate::table::{DataFile, FileSnapshot, ImmutableFileTable};
+use crate::table::{ColumnStats, DataFile, FileSnapshot, ImmutableFileTable};
 
 fn de(e: DuckLakeError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
@@ -103,16 +105,26 @@ impl DuckLakeSource {
         for d in p.get_inlined_deletes(table_id, snapshot_id).map_err(de)? {
             inlined_deletes.entry(d.data_file_id).or_default().push(d.row_id);
         }
+        let columns = p.get_table_structure(table_id, snapshot_id).map_err(de)?;
+        // Per-file column statistics from the catalog (no file reads). Older
+        // catalogs without the stats tables return none: files stay Edge.
+        let mut col_stats: HashMap<i64, Vec<DuckLakeFileColumnStatistics>> = HashMap::new();
+        for s in p.get_table_statistics(table_id, snapshot_id).map_err(de)?.files {
+            col_stats.entry(s.data_file_id).or_default().push(s);
+        }
         let mut files = Vec::new();
         let mut file_ids = HashMap::new();
         for f in p.get_table_files_for_select(table_id, snapshot_id).map_err(de)? {
             let path = resolve_path(&table_path, &f.file.path, f.file.path_is_relative).map_err(de)?;
             let identity = file_identity(&f, snapshot_id, inlined_deletes.get_mut(&f.data_file_id));
             file_ids.insert(path.clone(), f.data_file_id);
-            files.push(DataFile::new(path, &identity));
+            let stats = match (f.max_row_count, col_stats.get(&f.data_file_id)) {
+                (Some(rows), Some(cs)) => file_stats(&columns, rows, cs),
+                _ => HashMap::new(),
+            };
+            files.push(DataFile::new(path, &identity).with_all_stats(Arc::new(stats)));
         }
 
-        let columns = p.get_table_structure(table_id, snapshot_id).map_err(de)?;
         let inlined = p.scan_inlined_data(table_id, snapshot_id, &columns, None).map_err(de)?;
         let inlined_rows: usize = inlined.batches.iter().map(|b| b.num_rows()).sum();
         let inlined_path = format!("{}/{INLINED}", table_path.trim_end_matches('/'));
@@ -167,6 +179,62 @@ fn file_identity(f: &DuckLakeTableFile, snapshot_id: i64, inlined_deletes: Optio
         "{}|{}|{:?}|{delete}|{inlined}|{visible}",
         f.data_file_id, f.file.file_size_bytes, f.delete_file_id
     )
+}
+
+/// Column statistics of one data file, from `ducklake_file_column_stats`.
+///
+/// They describe the file as written, before any delete file or inlined
+/// deletion: deletes only remove rows, so the bounds stay sound and a column
+/// that was all null (or had no nulls) still is. Long strings are truncated
+/// by DuckDB with min rounded down and max rounded up, so they stay sound
+/// bounds as well. Floats (NaN), nested and unparsable types are left out.
+fn file_stats(
+    columns: &[DuckLakeTableColumn],
+    rows: i64,
+    stats: &[DuckLakeFileColumnStatistics],
+) -> HashMap<String, ColumnStats> {
+    let Ok(row_count) = u64::try_from(rows) else { return HashMap::new() };
+    let by_id: HashMap<i64, &DuckLakeTableColumn> = columns.iter().map(|c| (c.column_id, c)).collect();
+    let mut out = HashMap::new();
+    for s in stats {
+        let Some(column) = by_id.get(&s.column_id) else { continue }; // a nested field
+        let Ok(data_type) = datafusion_ducklake::types::ducklake_to_arrow_type(&column.column_type) else { continue };
+        if !stat_type(&data_type) {
+            continue;
+        }
+        let Some(null_count) = s.null_count.and_then(|n| u64::try_from(n).ok()) else { continue };
+        let Ok(null) = ScalarValue::try_from(&data_type) else { continue };
+        let (min, max) = if null_count >= row_count {
+            (null.clone(), null)
+        } else {
+            let parse = |v: &Option<String>| v.as_deref().and_then(|v| parse_stat(v, &data_type));
+            match (parse(&s.min_value), parse(&s.max_value)) {
+                (Some(min), Some(max)) => (min, max),
+                _ => continue,
+            }
+        };
+        out.insert(column.column_name.clone(), ColumnStats { min, max, null_count, row_count });
+    }
+    out
+}
+
+/// Types whose catalog min/max are exact bounds that compare like the column.
+fn stat_type(t: &DataType) -> bool {
+    !(t.is_floating() || t.is_nested() || matches!(t, DataType::Binary | DataType::LargeBinary | DataType::BinaryView))
+}
+
+/// A DuckDB-canonical stats string (`42`, `2026-01-01 10:00:00`,
+/// `2026-01-01 10:00:00+00`, `EU`, …) as a scalar of type `t`.
+fn parse_stat(v: &str, t: &DataType) -> Option<ScalarValue> {
+    if v.eq_ignore_ascii_case("infinity") || v.eq_ignore_ascii_case("-infinity") {
+        return None;
+    }
+    let cast = |v: &str| ScalarValue::Utf8(Some(v.to_string())).cast_to(t).ok().filter(|s| !s.is_null());
+    // Arrow wants `+00:00`; DuckDB writes the offset as `+00`.
+    cast(v).or_else(|| match v.rsplit_once(['+', '-']) {
+        Some((_, off)) if matches!(t, DataType::Timestamp(_, Some(_))) && off.len() == 2 => cast(&format!("{v}:00")),
+        _ => None,
+    })
 }
 
 /// One snapshot of a DuckLake table.

@@ -13,23 +13,30 @@
 //! [`crate::ImmutableFileTable`] whose file ids include the delete files that
 //! apply to each data file.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::TableProvider;
 use datafusion::catalog::empty::EmptyTable;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::arrow::array::Array;
+use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::prelude::SessionContext;
-use futures::TryStreamExt;
+use datafusion::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
+use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+#[allow(deprecated)] // simplest footer reader over an ObjectStore; DataFusion uses it too
+use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
+use datafusion::parquet::file::metadata::ParquetMetaData;
+use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use object_store::path::Path;
 
 use crate::store::stable_hash;
-use crate::table::{DataFile, FileSnapshot, ImmutableFileTable};
+use crate::table::{ColumnStats, DataFile, FileSnapshot, ImmutableFileTable};
 
 enum Files {
     /// Every `*.parquet` under this prefix of the store.
@@ -45,6 +52,9 @@ pub struct ParquetFiles {
     schema: SchemaRef,
     options: ListingOptions,
     files: Mutex<Files>,
+    /// Column statistics per file id, read from each file's footer once.
+    stats: Mutex<HashMap<String, Arc<HashMap<String, ColumnStats>>>>,
+    collect_stats: bool,
 }
 
 fn options() -> ListingOptions {
@@ -67,6 +77,8 @@ impl ParquetFiles {
             schema,
             options,
             files: Mutex::new(Files::Listed(table_url.prefix().clone())),
+            stats: Default::default(),
+            collect_stats: true,
         })
     }
 
@@ -85,7 +97,15 @@ impl ParquetFiles {
             .ok_or_else(|| DataFusionError::Plan("ParquetFiles::from_files: no files to infer the schema from".into()))?;
         let options = options();
         let schema = options.infer_schema(&ctx.state(), &file_url(&store_url, &first.0)?).await?;
-        Ok(Self { store, store_url, schema, options, files: Mutex::new(Files::Fixed(files)) })
+        Ok(Self {
+            store,
+            store_url,
+            schema,
+            options,
+            files: Mutex::new(Files::Fixed(files)),
+            stats: Default::default(),
+            collect_stats: true,
+        })
     }
 
     /// Replace the file list (for tables made with [`Self::from_files`]):
@@ -108,6 +128,111 @@ impl ParquetFiles {
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
+
+    /// Whether to read each new file's footer for column statistics
+    /// (default on). They let the cache decide filters like
+    /// `ts >= now() - interval '1 hour'` per file; each footer is read once.
+    pub fn with_column_stats(mut self, on: bool) -> Self {
+        self.collect_stats = on;
+        self
+    }
+
+    /// Exact statistics of every column of the file, from its footer.
+    #[allow(deprecated)]
+    async fn read_stats(&self, path: &str, size: u64) -> Result<HashMap<String, ColumnStats>> {
+        let mut reader = ParquetObjectReader::new(self.store.clone(), Path::from(path)).with_file_size(size);
+        let meta = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new()).await?;
+        Ok(file_stats(meta.schema(), meta.metadata(), &self.schema))
+    }
+
+    /// `files` with their statistics attached (read concurrently, memoized).
+    async fn attach_stats(&self, files: Vec<(DataFile, u64)>) -> Result<Vec<DataFile>> {
+        if !self.collect_stats {
+            return Ok(files.into_iter().map(|(f, _)| f).collect());
+        }
+        let known = self.stats.lock().unwrap().clone();
+        let out: Vec<DataFile> = futures::stream::iter(files)
+            .map(|(f, size)| {
+                let known = known.get(&f.id).cloned();
+                async move {
+                    let stats = match known {
+                        Some(s) => s,
+                        // Unreadable footers only cost the file its stats.
+                        None => Arc::new(self.read_stats(&f.path, size).await.unwrap_or_default()),
+                    };
+                    Ok::<_, DataFusionError>(f.with_all_stats(stats))
+                }
+            })
+            .buffered(16)
+            .try_collect()
+            .await?;
+        let mut memo = self.stats.lock().unwrap();
+        memo.retain(|id, _| out.iter().any(|f| &f.id == id));
+        for f in &out {
+            memo.entry(f.id.clone()).or_insert_with(|| f.stats.clone());
+        }
+        Ok(out)
+    }
+}
+
+/// Fold the row-group statistics of one file into exact per-column stats,
+/// typed as the table schema says. Columns whose stats are missing, inexact
+/// (e.g. truncated strings) or floating point are left out.
+fn file_stats(file_schema: &Schema, meta: &ParquetMetaData, table_schema: &Schema) -> HashMap<String, ColumnStats> {
+    let mut out = HashMap::new();
+    let groups = meta.row_groups();
+    let row_count: u64 = groups.iter().map(|g| g.num_rows() as u64).sum();
+    for field in table_schema.fields() {
+        let ty = field.data_type();
+        if ty.is_floating() || ty.is_nested() {
+            continue;
+        }
+        let Some(stats) = (|| -> Option<ColumnStats> {
+            let conv = StatisticsConverter::try_new(field.name(), file_schema, meta.file_metadata().schema_descr())
+                .ok()?
+                .with_missing_null_counts_as_zero(false);
+            let mins = conv.row_group_mins(groups).ok()?;
+            let maxes = conv.row_group_maxes(groups).ok()?;
+            let min_exact = conv.row_group_is_min_value_exact(groups).ok()?;
+            let max_exact = conv.row_group_is_max_value_exact(groups).ok()?;
+            let nulls = conv.row_group_null_counts(groups).ok()?;
+            let mut min: Option<ScalarValue> = None;
+            let mut max: Option<ScalarValue> = None;
+            let mut null_count = 0;
+            for (i, g) in groups.iter().enumerate() {
+                if nulls.is_null(i) {
+                    return None;
+                }
+                let n = nulls.value(i);
+                null_count += n;
+                if n == g.num_rows() as u64 {
+                    continue; // all null: no min/max to fold
+                }
+                if mins.is_null(i) || maxes.is_null(i) || !min_exact.value(i) || !max_exact.value(i) {
+                    return None;
+                }
+                let lo = ScalarValue::try_from_array(&mins, i).ok()?;
+                let hi = ScalarValue::try_from_array(&maxes, i).ok()?;
+                if min.as_ref().is_none_or(|m| lo.partial_cmp(m).is_some_and(|o| o.is_lt())) {
+                    min = Some(lo);
+                }
+                if max.as_ref().is_none_or(|m| hi.partial_cmp(m).is_some_and(|o| o.is_gt())) {
+                    max = Some(hi);
+                }
+            }
+            let null = ScalarValue::try_from(ty).ok()?;
+            Some(ColumnStats {
+                min: min.map_or(Some(null.clone()), |v| v.cast_to(ty).ok())?,
+                max: max.map_or(Some(null), |v| v.cast_to(ty).ok())?,
+                null_count,
+                row_count,
+            })
+        })() else {
+            continue;
+        };
+        out.insert(field.name().clone(), stats);
+    }
+    out
 }
 
 fn file_url(store_url: &ObjectStoreUrl, path: &str) -> Result<ListingTableUrl> {
@@ -143,7 +268,12 @@ impl ImmutableFileTable for ParquetFiles {
                     .collect()
             }
         };
-        let mut files: Vec<DataFile> = pairs.iter().map(|(p, identity)| DataFile::new(p.clone(), identity)).collect();
+        // The identity starts with the size in both cases.
+        let sized = pairs.iter().map(|(p, identity)| {
+            let size = identity.split('|').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            (DataFile::new(p.clone(), identity), size)
+        });
+        let mut files = self.attach_stats(sized.collect()).await?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let ids: Vec<&str> = files.iter().map(|f| f.id.as_str()).collect();
         Ok(Arc::new(ParquetSnapshot {

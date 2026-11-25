@@ -25,6 +25,7 @@ use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan, UserDefin
 
 use crate::UnregisteredTables;
 use crate::cache::{Cache, CacheEntry};
+use crate::lift::{self, Lifted};
 use crate::store::stable_hash;
 use crate::table::{Binding, Snapshot};
 
@@ -235,13 +236,33 @@ impl Rewriter<'_> {
             }));
         }
 
-        let lbl = cacheable.then(|| label(&plan));
+        let mut lbl = cacheable.then(|| label(&plan));
         let plan = match &plan {
             // Aggregate over one file table: cache partial states per segment.
             LogicalPlan::Aggregate(agg) if cacheable => match self.split_table(&agg.input) {
-                Ok(Some(snap)) => LogicalPlan::Extension(Extension {
-                    node: Arc::new(SegmentedAggregateNode { id: short_id(&base_key), base_key, snap, input: plan }),
-                }),
+                Ok(Some(snap)) => {
+                    let fraction = self.cache.lift_max_edge_fraction();
+                    let (base_key, lifted, windowless) = match lift::lift(&plan, &snap, &self.cache.registry, fraction)? {
+                        // The whole result is keyed by the lifted literals
+                        // (e.g. a folded `now()`), so it is rarely asked
+                        // for again: cache only the per-file states.
+                        Some(l) => {
+                            lbl = None;
+                            (cache_key(&l.windowless), l.lifted, l.windowless)
+                        }
+                        None => (base_key, vec![], plan.clone()),
+                    };
+                    LogicalPlan::Extension(Extension {
+                        node: Arc::new(SegmentedAggregateNode {
+                            id: short_id(&base_key),
+                            base_key,
+                            snap,
+                            lifted,
+                            windowless,
+                            input: plan,
+                        }),
+                    })
+                }
                 _ => self.recurse(plan)?,
             },
             _ => self.recurse(plan)?,
@@ -387,11 +408,18 @@ impl UserDefinedLogicalNodeCore for CacheReadNode {
 /// table snapshot `snap`. `input` is the original Aggregate node; it is planned once
 /// normally (as a template) and once per missing segment with a scan that
 /// reads only that segment's files.
+///
+/// With `lifted` conjuncts, segments are computed from `windowless` (the
+/// aggregate without them) over files the conjuncts keep entirely, and
+/// `base_key` is the key of `windowless`; files they keep partly are read
+/// with `input`, files they exclude are skipped.
 #[derive(Clone)]
 pub struct SegmentedAggregateNode {
     pub base_key: String,
     pub id: String,
     pub snap: Arc<Snapshot>,
+    pub lifted: Vec<Lifted>,
+    pub windowless: LogicalPlan,
     pub input: LogicalPlan,
 }
 
@@ -432,7 +460,11 @@ impl UserDefinedLogicalNodeCore for SegmentedAggregateNode {
         vec![]
     }
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SegmentedAggregate: id={} table={} files={}", self.id, self.snap.name, self.snap.files().len())
+        write!(f, "SegmentedAggregate: id={} table={} files={}", self.id, self.snap.name, self.snap.files().len())?;
+        if !self.lifted.is_empty() {
+            write!(f, " lifted={:?}", self.lifted)?;
+        }
+        Ok(())
     }
     fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, mut inputs: Vec<LogicalPlan>) -> Result<Self> {
         Ok(Self { input: inputs.swap_remove(0), ..self.clone() })

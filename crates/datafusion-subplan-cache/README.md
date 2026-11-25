@@ -11,6 +11,12 @@ files.
 - **Per-file partial aggregates**: after an append, delete or compaction,
   an aggregate reads only the files that changed and merges them with the
   cached partial states of the files that did not.
+- **Filters decided per file**: simple filter conjuncts (`ts >= now() -
+  interval '1 hour'`, `region = 'EU'`, `day IN (…)`, `x IS NULL`) are taken
+  out of the cache key and decided per file from its column statistics.
+  Files a filter keeps whole reuse their cached partial states, files it
+  excludes are not read, and only the files its bounds cut through are read
+  live. A sliding time window recomputes just the newest files.
 - **Shared persistent store** (optional): a local directory, `gs://` or `s3://`
   prefix. Any number of processes read and write it concurrently, with no
   locks: manifests are created with conditional writes, so the first writer
@@ -91,6 +97,39 @@ every table it reads was registered with the cache (`register_table`,
 A table re-registered behind the cache's back (a plain
 `ctx.register_table`) is unknown again, never matched to an old snapshot.
 
+## Filters decided per file (`now()` windows and friends)
+
+DataFusion folds `now()` into a literal, so `WHERE ts >= now() - interval
+'1 hour'` has a new plan text on every run. For an aggregate over one file
+table, the cache lifts such conjuncts out of the key and classifies each
+file by its per-column min / max / null count:
+
+| | the file's rows | the file is |
+|---|---|---|
+| inside | all pass every lifted conjunct | answered from its cached *unfiltered* partial state |
+| outside | none pass some lifted conjunct | not read |
+| edge | some pass, or no statistics | read live with the full predicate, not cached |
+
+Liftable conjuncts are `col op literal` (`= != < <= > >=`, either side,
+literal casts allowed), `BETWEEN`, `IN (…)`, `c = a OR c = b …`, and
+`IS [NOT] NULL`, on a plain column of the table that is not a float. Other
+conjuncts stay in the key as before.
+
+No configuration is needed: `ParquetFiles` reads each new file's footer
+once (`with_column_stats(false)` turns that off), and `DeltaSource` uses the
+log's per-file stats and partition values. `DuckLakeSource` uses the
+catalog's `ducklake_file_column_stats`, so it reads no files either. For your own adapter, attach
+exact stats with `DataFile::with_stats`. A conjunct is lifted only if it
+leaves at most `Builder::lift_max_edge_fraction` (default 0.25, at least two
+files) of the files as edge files. So predicates on columns the data is not
+laid out by, like `amount > 100` with every file spanning all amounts, stay
+in the key, and repeating such a query is still a whole-result hit.
+Lifted aggregates store no whole result. A repeat merges the cached
+per-file states and rereads the edge files.
+
+New segments are ordered by the first lifted column, so a sliding window
+invalidates few of them. Use a small `segment_files` for time series.
+
 ## Writing an adapter (Iceberg, DuckLake, …)
 
 Implement two traits. Sketch for an Iceberg table with merge-on-read deletes:
@@ -142,7 +181,9 @@ Without delete files, no adapter is needed: pass the snapshot's file list to
 - Cache keys include DataFusion's plan text and partial-state layout; the
   store path includes the DataFusion version, so upgrading starts a fresh
   cache.
-- Volatile expressions (`random()`, `now()`) and correlated subqueries are
-  never cached.
+- Volatile expressions (`random()`) and correlated subqueries are never
+  cached. `now()` is folded to a literal and is handled by per-file filters
+  (above) where its column has statistics; otherwise it makes a new key on
+  every run.
 - Per-file reuse applies to aggregates over one registered file table,
   optionally inner/semi-joined with static tables.

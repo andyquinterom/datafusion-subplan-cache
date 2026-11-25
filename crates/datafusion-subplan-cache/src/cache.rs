@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -116,6 +116,13 @@ pub struct SegmentUse {
     pub reused: Vec<Vec<String>>,
     /// File ids of each newly computed segment.
     pub computed: Vec<Vec<String>>,
+    /// Filter conjuncts lifted out of the key (decided per file from stats).
+    pub lifted: Vec<String>,
+    /// File ids read live with the full predicate (not cached): files the
+    /// lifted conjuncts keep only partly, or without statistics.
+    pub edge: Vec<String>,
+    /// Number of files the lifted conjuncts exclude entirely (not read).
+    pub skipped: usize,
 }
 
 /// The shared state behind [`crate::SubplanCache`].
@@ -125,6 +132,8 @@ pub struct Cache {
     segment_uses: Mutex<Vec<SegmentUse>>,
     /// How many data files go into one newly computed segment.
     pub segment_files: AtomicUsize,
+    /// See [`crate::Builder::lift_max_edge_fraction`] (f64 bits).
+    pub lift_max_edge_fraction: AtomicU64,
     /// Optional persistent tier (local directory, S3, GCS).
     pub store: Option<Arc<PersistentStore>>,
     /// Manifests already read from the store (or written by us).
@@ -158,6 +167,7 @@ impl Cache {
     pub(crate) fn new(
         store: Option<Arc<PersistentStore>>,
         segment_files: usize,
+        lift_max_edge_fraction: f64,
         policy: UnregisteredTables,
         max_bytes: usize,
     ) -> Self {
@@ -166,6 +176,7 @@ impl Cache {
             events: Default::default(),
             segment_uses: Default::default(),
             segment_files: AtomicUsize::new(segment_files),
+            lift_max_edge_fraction: AtomicU64::new(lift_max_edge_fraction.to_bits()),
             store,
             seen: Default::default(),
             pending: Default::default(),
@@ -391,6 +402,10 @@ impl Cache {
 
     pub fn event(&self, msg: String) {
         self.events.lock().unwrap().push(msg);
+    }
+
+    pub fn lift_max_edge_fraction(&self) -> f64 {
+        f64::from_bits(self.lift_max_edge_fraction.load(Ordering::Relaxed))
     }
 
     pub fn record_segment_use(&self, u: SegmentUse) {

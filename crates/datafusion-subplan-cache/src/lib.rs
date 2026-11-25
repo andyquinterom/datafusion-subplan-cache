@@ -38,6 +38,7 @@
 pub mod adapters;
 mod cache;
 mod exec;
+mod lift;
 pub mod rewrite;
 pub mod store;
 pub mod table;
@@ -65,7 +66,7 @@ pub use cache::{CacheEntry, EntryData, SegmentUse};
 pub use exec::{CacheExtensionPlanner, CachingQueryPlanner};
 pub use rewrite::RewriteReport;
 pub use store::PersistentStore;
-pub use table::{DataFile, FileSnapshot, ImmutableFileTable, Snapshot};
+pub use table::{ColumnStats, DataFile, FileSnapshot, ImmutableFileTable, Snapshot};
 
 use cache::Cache;
 use table::{Binding, Registered};
@@ -90,6 +91,7 @@ pub enum UnregisteredTables {
 pub struct Builder {
     store: Option<Arc<PersistentStore>>,
     segment_files: usize,
+    lift_max_edge_fraction: f64,
     policy: UnregisteredTables,
     max_memory: usize,
 }
@@ -117,6 +119,22 @@ impl Builder {
         self
     }
 
+    /// Predicate lifting (default 0.25). A filter conjunct such as
+    /// `ts >= <literal>`, `region = 'EU'`, `day IN (…)` or `x IS NULL` on the
+    /// table of a per-file aggregate is taken out of the cache key when the
+    /// files' column statistics decide it for most files: files it keeps
+    /// whole reuse their cached unfiltered partial states, files it
+    /// excludes are not read, and the rest ("edge" files) are read live with
+    /// the full predicate. A conjunct is lifted only if at most this
+    /// fraction of the files (at least two) would be edge files, so
+    /// predicates on columns the data is not laid out by stay in the key.
+    /// This is what lets `ts >= now() - interval '1 hour'` reuse work.
+    /// `0.0` turns lifting off.
+    pub fn lift_max_edge_fraction(mut self, fraction: f64) -> Self {
+        self.lift_max_edge_fraction = fraction.clamp(0.0, 1.0);
+        self
+    }
+
     /// See [`UnregisteredTables`] (default `Skip`).
     pub fn unregistered_tables(mut self, policy: UnregisteredTables) -> Self {
         self.policy = policy;
@@ -132,7 +150,13 @@ impl Builder {
 
     pub fn build(self) -> SubplanCache {
         SubplanCache {
-            inner: Arc::new(Cache::new(self.store, self.segment_files, self.policy, self.max_memory)),
+            inner: Arc::new(Cache::new(
+                self.store,
+                self.segment_files,
+                self.lift_max_edge_fraction,
+                self.policy,
+                self.max_memory,
+            )),
         }
     }
 }
@@ -154,6 +178,7 @@ impl SubplanCache {
         Builder {
             store: None,
             segment_files: 4,
+            lift_max_edge_fraction: 0.25,
             policy: UnregisteredTables::default(),
             max_memory: cache::DEFAULT_MAX_MEMORY,
         }
