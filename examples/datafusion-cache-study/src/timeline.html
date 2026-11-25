@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Query latency through table changes</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --event: #898781;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --text-primary: #f0efec;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --event: #6d6c67;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --event: #6d6c67;
+  }
+  html, body { margin: 0; }
+  .viz-root {
+    background: var(--surface-1);
+    color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    min-height: 100vh;
+    padding: 28px 32px 40px;
+    box-sizing: border-box;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); margin: 0 0 18px; max-width: 900px; }
+  .legend { display: flex; gap: 20px; align-items: center; margin: 0 0 6px; color: var(--text-secondary); font-size: 13px; flex-wrap: wrap; }
+  .key { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 18px; height: 2px; border-radius: 1px; display: inline-block; }
+  .chart-wrap { position: relative; max-width: 1100px; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  svg text { font-family: inherit; }
+  .tick { fill: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .axis-title { fill: var(--text-secondary); font-size: 12px; }
+  .ev-label { fill: var(--text-primary); font-size: 12px; font-weight: 600; }
+  .line-label { font-size: 12px; fill: var(--text-secondary); }
+  .tooltip {
+    position: absolute; pointer-events: none; opacity: 0; transition: opacity .08s;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--axis); border-radius: 8px; padding: 8px 10px;
+    font-size: 12px; line-height: 1.5; box-shadow: 0 4px 14px rgba(0,0,0,.12);
+    min-width: 210px; font-variant-numeric: tabular-nums;
+  }
+  .tooltip .t-head { font-weight: 600; margin-bottom: 2px; }
+  .tooltip .t-row { display: flex; justify-content: space-between; gap: 14px; }
+  .tooltip .t-how { color: var(--text-secondary); margin-top: 2px; }
+  .tooltip .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  details { margin-top: 22px; max-width: 1100px; }
+  summary { cursor: pointer; color: var(--text-secondary); }
+  table { border-collapse: collapse; margin-top: 10px; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 4px 12px 4px 0; border-bottom: 1px solid var(--grid); }
+  th { color: var(--text-secondary); font-weight: 500; }
+  td.num { text-align: right; }
+  tr.event td { color: var(--text-secondary); font-style: italic; }
+  .query { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--text-secondary); }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <h1>Query latency as the Delta table changes</h1>
+  <p class="sub" id="sub"></p>
+  <div class="legend" id="legend"></div>
+  <div class="chart-wrap" id="wrap">
+    <svg id="chart" role="img" aria-label="Line chart of query time per run, with and without cache"></svg>
+    <div class="tooltip" id="tip"></div>
+  </div>
+  <details>
+    <summary>Table view</summary>
+    <table id="table"></table>
+  </details>
+</div>
+<script>
+const DATA = /*__DATA__*/null;
+
+const W = 1100, H = 460, M = { top: 44, right: 150, bottom: 46, left: 62 };
+const iw = W - M.left - M.right, ih = H - M.top - M.bottom;
+const runs = DATA.runs, events = DATA.events;
+const n = runs.length;
+const NS = "http://www.w3.org/2000/svg";
+
+const hasMemory = runs.some(r => r.memory !== null && r.memory !== undefined);
+// Fixed slot per entity: blue = subplan cache, orange = baseline, aqua = memory-only.
+const series = [
+  { key: "uncached", color: "var(--series-2)", name: "No cache", legend: "No cache (baseline)" },
+  ...(hasMemory ? [{ key: "memory", color: "var(--series-3)", name: "Memory-only", legend: "Memory-only cache" }] : []),
+  { key: "cached", color: "var(--series-1)", name: hasMemory ? "Memory + store" : "With cache", legend: hasMemory ? "Memory + persistent store" : "With subplan cache" },
+];
+document.getElementById("legend").innerHTML =
+  [...series].reverse().map(s => `<span class="key"><span class="swatch" style="background:${s.color}"></span>${s.legend}</span>`).join("") +
+  `<span class="key"><span class="swatch" style="background:none;border-left:1px dashed var(--event);height:12px;width:0"></span>Event</span>`;
+document.getElementById("sub").innerHTML =
+  `${DATA.scenario} ` +
+  `Each run executes the same query ${series.length} ways; dashed lines mark events. ` +
+  `Cache segment size: ${DATA.segsize} file(s).<br>` +
+  `<span class="query">${DATA.query.replace(/</g, "&lt;")}</span>`;
+
+const maxY = Math.max(...runs.flatMap(r => series.map(s => r[s.key])));
+const niceStep = (span) => { const raw = span / 5, p = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 2.5, 5, 10].map(m => m * p).find(s => s >= raw); };
+const step = niceStep(maxY), yTop = Math.ceil(maxY / step) * step;
+const x = i => M.left + (n === 1 ? iw / 2 : (i - 1) / (n - 1) * iw);
+const y = v => M.top + ih - v / yTop * ih;
+
+const svg = document.getElementById("chart");
+svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+const el = (tag, attrs, parent = svg) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; };
+const txt = (s, attrs, parent) => { const e = el("text", attrs, parent); e.textContent = s; return e; };
+
+// grid + y ticks
+for (let v = 0; v <= yTop + 1e-9; v += step) {
+  el("line", { x1: M.left, x2: M.left + iw, y1: y(v), y2: y(v), stroke: v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 });
+  txt(`${+v.toFixed(1)}`, { x: M.left - 10, y: y(v) + 4, "text-anchor": "end", class: "tick" });
+}
+txt("ms", { x: M.left - 10, y: M.top - 14, "text-anchor": "end", class: "axis-title" });
+// x ticks
+for (const r of runs) txt(r.n, { x: x(r.n), y: M.top + ih + 20, "text-anchor": "middle", class: "tick" });
+txt("run", { x: M.left + iw / 2, y: H - 6, "text-anchor": "middle", class: "axis-title" });
+
+// event lines, between the last run before and the first run after
+for (const e of events) {
+  const ex = (x(e.after) + x(e.after + 1)) / 2;
+  el("line", { x1: ex, x2: ex, y1: M.top - 8, y2: M.top + ih, stroke: "var(--event)", "stroke-width": 1, "stroke-dasharray": "4 4" });
+  txt(e.label, { x: ex, y: M.top - 14, "text-anchor": "middle", class: "ev-label" });
+}
+
+// series
+for (const s of series) {
+  el("path", { d: runs.map((r, i) => `${i ? "L" : "M"}${x(r.n)},${y(r[s.key])}`).join(""), fill: "none", stroke: s.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" });
+  for (const r of runs) el("circle", { cx: x(r.n), cy: y(r[s.key]), r: 4, fill: s.color, stroke: "var(--surface-1)", "stroke-width": 2 });
+}
+// direct labels at the right end, nudged apart if they collide
+const last = runs[n - 1];
+let ly = series.map(s => ({ s, y: y(last[s.key]) }));
+ly.sort((a, b) => a.y - b.y);
+for (let k = 1; k < ly.length; k++) if (ly[k].y - ly[k - 1].y < 16) ly[k].y = ly[k - 1].y + 16;
+if (ly.length && ly[ly.length - 1].y > M.top + ih + 4) { const shift = ly[ly.length - 1].y - (M.top + ih + 4); ly.forEach(l => l.y -= shift); }
+for (const { s, y: yy } of ly) txt(s.name, { x: x(last.n) + 12, y: yy + 4, class: "line-label" });
+
+// hover: crosshair + tooltip
+const cross = el("line", { y1: M.top, y2: M.top + ih, stroke: "var(--axis)", "stroke-width": 1, opacity: 0 });
+const hl = series.map(s => el("circle", { r: 6, fill: s.color, stroke: "var(--surface-1)", "stroke-width": 2, opacity: 0 }));
+const hit = el("rect", { x: M.left - 20, y: M.top, width: iw + 40, height: ih, fill: "transparent" });
+const tip = document.getElementById("tip"), wrap = document.getElementById("wrap");
+const fmt = v => v >= 10 ? v.toFixed(0) : v.toFixed(1);
+function show(evt) {
+  const pt = svg.createSVGPoint(); pt.x = evt.clientX; pt.y = evt.clientY;
+  const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+  const i = Math.max(1, Math.min(n, Math.round((p.x - M.left) / iw * (n - 1)) + 1));
+  const r = runs[i - 1];
+  cross.setAttribute("x1", x(i)); cross.setAttribute("x2", x(i)); cross.setAttribute("opacity", 1);
+  series.forEach((s, k) => { hl[k].setAttribute("cx", x(i)); hl[k].setAttribute("cy", y(r[s.key])); hl[k].setAttribute("opacity", 1); });
+  const speed = r.uncached / r.cached;
+  tip.innerHTML =
+    `<div class="t-head">Run ${r.n} · ${r.phase}</div>` +
+    [...series].reverse().map(s => `<div class="t-row"><span><span class="dot" style="background:${s.color}"></span>${s.name}</span><b>${fmt(r[s.key])} ms</b></div>`).join("") +
+    `<div class="t-how">${r.how} · ${speed >= 1 ? speed.toFixed(1) + "× faster" : (1 / speed).toFixed(1) + "× slower"}${r.same ? "" : " · ✗ result differs"}</div>`;
+  const box = wrap.getBoundingClientRect(), scale = box.width / W;
+  let left = x(i) * scale + 14;
+  if (left + 240 > box.width) left = x(i) * scale - 14 - tip.offsetWidth;
+  tip.style.left = left + "px";
+  tip.style.top = (M.top * scale + 4) + "px";
+  tip.style.opacity = 1;
+}
+hit.addEventListener("mousemove", show);
+hit.addEventListener("mouseleave", () => { tip.style.opacity = 0; cross.setAttribute("opacity", 0); hl.forEach(h => h.setAttribute("opacity", 0)); });
+
+// table view
+const t = document.getElementById("table");
+const cols = [...series].reverse();
+let rows = `<tr><th>Run</th><th>Phase</th>${cols.map(s => `<th class="num">${s.name} (ms)</th>`).join("")}<th>How the cached run answered</th></tr>`;
+for (const r of runs) {
+  for (const e of events.filter(e => e.after === r.n - 1)) rows += `<tr class="event"><td></td><td colspan="${cols.length + 2}">${e.detail}</td></tr>`;
+  rows += `<tr><td>${r.n}</td><td>${r.phase}</td>${cols.map(s => `<td class="num">${r[s.key].toFixed(1)}</td>`).join("")}<td>${r.how}${r.same ? "" : " ✗"}</td></tr>`;
+}
+t.innerHTML = rows;
+</script>
+</body>
+</html>

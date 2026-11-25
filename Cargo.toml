@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/datafusion-subplan-cache", "examples/datafusion-cache-study"]
+default-members = ["examples/datafusion-cache-study"]
+
+[profile.release]
+debug = false

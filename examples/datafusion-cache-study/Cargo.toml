@@ -1,0 +1,20 @@
+[package]
+name = "datafusion-cache-study"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Example app for datafusion-subplan-cache: demo, timelines and a REPL over a Delta table."
+
+[dependencies]
+datafusion-subplan-cache = { path = "../../crates/datafusion-subplan-cache", features = ["delta"] }
+datafusion = "55.2"
+deltalake = { version = "1.1", features = ["datafusion"] }
+futures = "0.3"
+object_store = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+url = "2"
+
+[features]
+# Cache store and data on cloud storage: --cache-dir / --data-dir s3://bucket/prefix or gs://…
+s3 = ["datafusion-subplan-cache/s3", "object_store/aws"]
+gcs = ["datafusion-subplan-cache/gcs", "object_store/gcp", "deltalake/gcs"]

@@ -1,0 +1,33 @@
+[package]
+name = "datafusion-subplan-cache"
+version = "0.1.0"
+edition = "2024"
+description = "Transparent subplan and per-file partial-aggregate caching for DataFusion over immutable Parquet files (Delta, Iceberg, DuckLake, append-only folders)"
+license = "Apache-2.0"
+
+[dependencies]
+async-trait = "0.1"
+datafusion = "55.2"
+deltalake = { version = "1.1", features = ["datafusion"], optional = true }
+futures = "0.3"
+object_store = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+url = "2"
+
+[features]
+default = []
+# Adapter for Delta Lake tables (delta-rs).
+delta = ["dep:deltalake"]
+# Persistent cache store and ParquetFiles on Google Cloud Storage / S3.
+gcs = ["object_store/gcp", "deltalake?/gcs"]
+s3 = ["object_store/aws"]
+
+[dev-dependencies]
+deltalake = { version = "1.1", features = ["datafusion"] }
+
+[[example]]
+name = "quickstart_delta"
+required-features = ["delta"]
