@@ -9,6 +9,7 @@ license = "Apache-2.0"
 async-trait = "0.1"
 datafusion = "55.2"
 deltalake = { version = "1.1", features = ["datafusion"], optional = true }
+datafusion-ducklake = { version = "0.9", default-features = false, optional = true }
 futures = "0.3"
 object_store = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -21,13 +22,22 @@ url = "2"
 default = []
 # Adapter for Delta Lake tables (delta-rs).
 delta = ["dep:deltalake"]
+# Adapter for DuckLake tables (datafusion-ducklake), SQLite catalog backend.
+ducklake = ["dep:datafusion-ducklake", "datafusion-ducklake/metadata-sqlite"]
+# DuckLake with a PostgreSQL catalog.
+ducklake-postgres = ["ducklake", "datafusion-ducklake/metadata-postgres", "datafusion-ducklake/tls-rustls-ring"]
 # Persistent cache store and ParquetFiles on Google Cloud Storage / S3.
 gcs = ["object_store/gcp", "deltalake?/gcs"]
 s3 = ["object_store/aws"]
 
 [dev-dependencies]
 deltalake = { version = "1.1", features = ["datafusion"] }
+datafusion-ducklake = { version = "0.9", default-features = false, features = ["metadata-sqlite", "write-sqlite"] }
 
 [[example]]
 name = "quickstart_delta"
 required-features = ["delta"]
+
+[[example]]
+name = "quickstart_ducklake"
+required-features = ["ducklake"]

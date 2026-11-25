@@ -258,3 +258,102 @@ async fn delta_delete_recomputes_only_the_rewritten_file() -> Result<()> {
     assert_eq!((uses[0].reused.len(), uses[0].computed.len()), (2, 1));
     Ok(())
 }
+
+/// A SQLite-backed DuckLake in a temp dir with table `main.facts` written in
+/// `files` INSERTs of 1000 rows each (one Parquet file each). Returns the
+/// writer session (catalog `lake`) and the catalog connection string.
+#[cfg(feature = "ducklake")]
+async fn ducklake_lake(name: &str, files: u64, inline_limit: usize) -> Result<(SessionContext, String)> {
+    use datafusion_ducklake::{
+        DuckLakeCatalog, DuckLakeWriteOptions, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+    };
+    let dl = |e: datafusion_ducklake::DuckLakeError| datafusion_subplan_cache::datafusion::common::DataFusionError::External(Box::new(e));
+    let dir = temp_dir(name);
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let conn = format!("sqlite:{}?mode=rwc", dir.join("catalog.db").display());
+    let writer = SqliteMetadataWriter::new_with_init(&conn).await.map_err(dl)?;
+    writer.set_data_path(data.to_str().unwrap()).map_err(dl)?;
+    let snapshot = writer.create_snapshot().map_err(dl)?;
+    writer.get_or_create_schema("main", None, snapshot).map_err(dl)?;
+    let provider = SqliteMetadataProvider::new(&conn).await.map_err(dl)?;
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
+        .map_err(dl)?
+        .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(inline_limit));
+    let ctx = SessionContext::new();
+    DuckLakeCatalog::register(&ctx, "lake", catalog);
+    let rows = |n: u64| format!("SELECT value % 10 AS k, value AS v FROM range({}, {})", n * 1000, (n + 1) * 1000);
+    ctx.sql("CREATE TABLE lake.main.facts (k BIGINT NOT NULL, v BIGINT NOT NULL)").await?.collect().await?;
+    for n in 0..files {
+        ctx.sql(&format!("INSERT INTO lake.main.facts {}", rows(n))).await?.collect().await?;
+    }
+    Ok((ctx, conn))
+}
+
+#[cfg(feature = "ducklake")]
+async fn ducklake_fixture(name: &str, files: u64, inline_limit: usize) -> Result<(Fixture, SessionContext)> {
+    use datafusion_subplan_cache::DuckLakeSource;
+    let (lake, conn) = ducklake_lake(name, files, inline_limit).await?;
+    let cache = SubplanCache::builder().segment_files(1).build();
+    let ctx = cache.session_context();
+    cache.register_table(&ctx, "facts", DuckLakeSource::open_sqlite(&conn, "main", "facts").await?).await?;
+    Ok((Fixture { cache, ctx, facts: temp_dir(name) }, lake))
+}
+
+#[cfg(feature = "ducklake")]
+async fn ducklake_expected(lake: &SessionContext) -> Result<String> {
+    Ok(text(&lake.sql(&AGG.replace("FROM facts", "FROM lake.main.facts")).await?.collect().await?))
+}
+
+#[cfg(feature = "ducklake")]
+#[tokio::test]
+async fn ducklake_append_reuses_existing_files() -> Result<()> {
+    let (f, lake) = ducklake_fixture("ducklake-append", 3, 0).await?;
+    run(&f, AGG).await?;
+    let uses = f.cache.take_segment_uses();
+    assert_eq!((uses[0].reused.len(), uses[0].computed.len()), (0, 3));
+
+    lake.sql("INSERT INTO lake.main.facts SELECT value % 10 AS k, value AS v FROM range(3000, 4000)").await?.collect().await?;
+    f.cache.refresh(&f.ctx).await?;
+    let got = text(&f.ctx.sql(AGG).await?.collect().await?);
+    let uses = f.cache.take_segment_uses();
+    assert_eq!((uses[0].reused.len(), uses[0].computed.len()), (3, 1));
+    assert_eq!(got, ducklake_expected(&lake).await?);
+    // Walks the catalog's snapshot history (timestamps parsed from the catalog).
+    f.cache.purge(std::time::Duration::from_secs(3600)).await?;
+    Ok(())
+}
+
+#[cfg(feature = "ducklake")]
+#[tokio::test]
+async fn ducklake_delete_recomputes_only_that_file() -> Result<()> {
+    let (f, lake) = ducklake_fixture("ducklake-delete", 3, 0).await?;
+    run(&f, AGG).await?;
+    f.cache.take_segment_uses();
+
+    lake.sql("DELETE FROM lake.main.facts WHERE v = 1500").await?.collect().await?;
+    f.cache.refresh(&f.ctx).await?;
+    let got = text(&f.ctx.sql(AGG).await?.collect().await?);
+    let uses = f.cache.take_segment_uses();
+    assert_eq!((uses[0].reused.len(), uses[0].computed.len()), (2, 1));
+    assert_eq!(got, ducklake_expected(&lake).await?);
+    Ok(())
+}
+
+#[cfg(feature = "ducklake")]
+#[tokio::test]
+async fn ducklake_inlined_rows_are_counted_once() -> Result<()> {
+    // Inserts of up to 100 rows stay in the catalog; the 1000-row ones are files.
+    let (f, lake) = ducklake_fixture("ducklake-inlined", 2, 100).await?;
+    run(&f, AGG).await?;
+    f.cache.take_segment_uses();
+
+    lake.sql("INSERT INTO lake.main.facts SELECT value % 10 AS k, value AS v FROM range(5000, 5010)").await?.collect().await?;
+    f.cache.refresh(&f.ctx).await?;
+    let got = text(&f.ctx.sql(AGG).await?.collect().await?);
+    let uses = f.cache.take_segment_uses();
+    assert_eq!((uses[0].reused.len(), uses[0].computed.len()), (2, 1));
+    assert!(uses[0].computed[0][0].contains("/__inlined__:"), "{:?}", uses[0].computed);
+    assert_eq!(got, ducklake_expected(&lake).await?);
+    Ok(())
+}

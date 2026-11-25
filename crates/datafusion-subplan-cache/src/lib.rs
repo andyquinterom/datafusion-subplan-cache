@@ -57,6 +57,10 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 pub use adapters::parquet::ParquetFiles;
 #[cfg(feature = "delta")]
 pub use adapters::delta::DeltaSource;
+#[cfg(feature = "ducklake")]
+pub use adapters::ducklake::{DuckLakeSnapshot, DuckLakeSource};
+#[cfg(feature = "ducklake")]
+pub use datafusion_ducklake;
 pub use cache::{CacheEntry, EntryData, SegmentUse};
 pub use exec::{CacheExtensionPlanner, CachingQueryPlanner};
 pub use rewrite::RewriteReport;

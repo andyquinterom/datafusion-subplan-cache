@@ -29,6 +29,7 @@ let ctx = cache.session_context();          // or: cache.install(SessionStateBui
 // Tables the cache can follow file by file:
 cache.register_table(&ctx, "events", ParquetFiles::open(&ctx, "file:///data/events/").await?).await?;
 cache.register_table(&ctx, "sales", DeltaSource::open("gs://bucket/sales/").await?).await?;   // `delta` feature
+cache.register_table(&ctx, "orders", DuckLakeSource::open_sqlite("sqlite:/data/lake.db", "main", "orders").await?).await?;   // `ducklake` feature
 
 // Tables that never change (dimension tables, lookups):
 ctx.register_parquet("customers", "/data/customers.parquet", Default::default()).await?;
@@ -42,10 +43,19 @@ cache.purge(Duration::from_secs(3600)).await?;   // maintenance: delete entries 
 ```
 
 Runnable: `cargo run -p datafusion-subplan-cache --example quickstart_parquet`
-and `--features delta --example quickstart_delta`.
+, `--features delta --example quickstart_delta` and
+`--features ducklake --example quickstart_ducklake`.
 
-Features: `delta` (Delta adapter via delta-rs), `gcs`, `s3` (cloud stores for
-the cache store and `ParquetFiles`).
+Features: `delta` (Delta adapter via delta-rs), `ducklake` (DuckLake adapter
+via datafusion-ducklake, SQLite catalogs), `ducklake-postgres` (adds
+PostgreSQL catalogs), `gcs`, `s3` (cloud stores for the cache store and
+`ParquetFiles`).
+
+`DuckLakeSource::new` takes any `datafusion_ducklake::MetadataProvider`, so
+other catalog backends (MySQL, DuckDB) work by enabling that backend's feature
+on your own `datafusion-ducklake` dependency. As with any DuckLake catalog,
+register the object store of the lake's data path on the session
+(`ctx.register_object_store`) unless it is local.
 
 ## The contract: immutable files
 
@@ -60,7 +70,8 @@ What breaks the contract (and so must be reflected in the id):
 - row-level deletes stored separately (Delta deletion vectors, Iceberg
   position/equality delete files, DuckLake delete files): include the delete
   files that apply to a data file in its id. The Delta adapter does this for
-  deletion vectors;
+  deletion vectors, the DuckLake adapter for delete files and inlined
+  deletions (DuckLake rows inlined in the catalog count as one more file);
 - overwriting a file under the same name: include its etag/mtime in the id
   (`ParquetFiles` does).
 

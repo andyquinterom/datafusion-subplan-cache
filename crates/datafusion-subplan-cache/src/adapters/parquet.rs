@@ -6,10 +6,10 @@
 //!   stream sink, …);
 //! * [`ParquetFiles::from_files`] / [`ParquetFiles::set_files`]: an explicit
 //!   list the caller gets from its own catalog, e.g. the data files of an
-//!   Iceberg or DuckLake snapshot.
+//!   Iceberg snapshot (DuckLake has its own adapter, `DuckLakeSource`).
 //!
 //! This adapter applies no row-level deletes. A table format with delete
-//! files (Iceberg merge-on-read, DuckLake deletes) needs its own
+//! files (Iceberg merge-on-read) needs its own
 //! [`crate::ImmutableFileTable`] whose file ids include the delete files that
 //! apply to each data file.
 
