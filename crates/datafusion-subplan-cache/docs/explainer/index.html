@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subplan Cache Explained</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* VOICE work: a technical explainer for engineers, narrated slowly like a guided tour
+   IDEA a transit network map: a query plan is a route, cache nodes are interchanges where work is skipped
+   PICTURE one stage that plays the story: plan trees, file tiles and segments, a time window, a store race
+   COLOUR deep green ground, lime-white for cached work, coral for work done live, grey for skipped
+   TYPE Inter Tight 700 display, Inter text, JetBrains Mono for plan text
+   LAYOUT green title band, then the player: chapter rail, stage, narration bar with controls; phone stacks */
+:root{color-scheme:light dark;--bg:light-dark(#ffffff,#0c1513);--ink:light-dark(#10201c,#e6eeea);--mute:light-dark(#5b6b66,#9aaca6);--rule:light-dark(#d9e0dd,#24332f);--green:#00463c;--green2:light-dark(#00463c,#7fd3b8);--lime:#e6f5c8;--coral:#ff6f59;--coralink:light-dark(#c2361f,#ff8a77);--panel:light-dark(#f3f6f4,#13201d);--skip:light-dark(#eef1f0,#18241f);--cell:light-dark(#c9d6d1,#34463f)}
+:root[data-theme=light]{color-scheme:light}:root[data-theme=dark]{color-scheme:dark}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Inter,system-ui,sans-serif;overflow-x:clip}
+h1,h2{font-family:"Inter Tight",Inter,sans-serif;font-weight:700;letter-spacing:-.02em;line-height:1.05;text-wrap:balance;margin:0}
+h1{font-size:clamp(32px,4.6vw,52px);max-width:20ch}
+h2{font-size:clamp(24px,2.6vw,32px)}
+p{margin:.6em 0;max-width:68ch}
+code,.mono{font-family:"JetBrains Mono",ui-monospace,monospace;font-size:13px}
+code{overflow-wrap:anywhere}
+.band{padding-block:clamp(28px,4vw,56px);padding-left:max(5vw,16px);padding-right:max(5vw,16px)}
+.wrap{max-width:1240px;margin:0 auto}
+.hero{background:#00463c;color:#f2f7f4}
+.hero .lede{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:20px 48px;align-items:end}
+.hero p{color:#cfe2da}
+button,select{font:600 15px Inter,sans-serif;min-height:44px;padding:0 16px;border-radius:8px;cursor:pointer;background:var(--bg);color:var(--ink);border:1px solid var(--rule)}
+button:focus-visible,select:focus-visible{outline:3px solid var(--coral);outline-offset:2px}
+button:hover{border-color:var(--green2)}
+.player{padding-top:24px}
+.rail{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px}
+.rail button{flex:1 0 auto;min-height:40px;font-size:13px;padding:0 12px;color:var(--mute);background:var(--panel);border-color:transparent;text-align:left}
+.rail button.on{background:var(--green);color:#fff}
+.rail button.done{color:var(--ink)}
+.stage{position:relative;min-height:470px;margin-top:14px;border:1px solid var(--rule);border-radius:14px;padding:18px;background:var(--bg)}
+.scene{display:none}.scene.on{display:block;animation:fade .5s ease-out}
+@keyframes fade{from{opacity:0}}
+.narr{position:sticky;bottom:0;z-index:2;margin-top:14px;background:#00463c;color:#f2f7f4;border-radius:14px;padding:16px 18px 14px;box-shadow:0 -8px 24px color-mix(in srgb,var(--bg) 80%,transparent)}
+.narr .ch{font-size:13px;color:#a8c9be}
+.narr .cap{font-size:clamp(17px,1.6vw,20px);line-height:1.45;margin:4px 0 12px;min-height:3em;max-width:80ch}
+.narr .cap.new{animation:in .5s ease-out}
+.bar{height:4px;background:#0f5a4c;border-radius:2px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--lime)}
+.ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}
+.narr button,.narr select{background:transparent;color:#f2f7f4;border-color:#3f7d70}
+.narr button:hover{background:#0b5a4d}
+.narr .pp{background:var(--lime);color:#00463c;border-color:var(--lime);min-width:96px}
+.narr .count{margin-left:auto;font-size:13px;color:#a8c9be;white-space:nowrap}
+.narr label{font-size:13px;color:#a8c9be;display:flex;gap:6px;align-items:center}
+.narr option{color:#10201c}
+@keyframes in{from{opacity:0;transform:translateY(4px)}}
+@keyframes pulse{50%{box-shadow:0 0 0 4px color-mix(in srgb,var(--coral) 45%,transparent)}}
+.born{animation:in .6s ease-out}
+/* plan scene */
+.sql{background:var(--panel);border-radius:8px;padding:12px 14px;margin:0 0 12px;white-space:pre-wrap;color:var(--ink)}
+.plans{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.pl{background:#0a5547;border-radius:10px;padding:12px 10px 14px;min-height:120px}
+.pl h3{margin:0 0 8px;font:600 13px Inter,sans-serif;color:#b9d8cd}
+.nd{position:relative;padding:5px 8px 5px calc(var(--d)*14px + 8px);border-radius:6px;line-height:1.35;font-family:"JetBrains Mono",monospace;font-size:13px;color:#e8f1ed;overflow-wrap:anywhere}
+.nd b{font-weight:600;color:#fff}.nd i{font-style:normal;color:#9cc2b6}
+.nd.dep::before{content:"└";position:absolute;left:calc(var(--d)*14px - 6px);color:#5f9b8c}
+.nd.cache{background:var(--lime);color:#00463c}.nd.cache b{color:#00463c}.nd.cache i{color:#2c6b5d}.nd.cache::before{color:#00463c}
+.nd.live{background:#ffe1db;color:#5c1a0f}.nd.live b{color:#5c1a0f}.nd.live i{color:#8f3c2e}
+.hl{box-shadow:0 0 0 2px var(--coral);animation:pulse 1.6s ease-in-out infinite}
+.keyrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;margin-top:12px;align-items:start}
+.key{background:#003a32;color:#cfe2da;border-radius:10px;padding:12px 14px;white-space:pre-wrap;overflow-wrap:anywhere;margin:0;min-height:60px}
+.key .data{color:var(--lime);font-weight:600}
+.badge{font:700 18px "Inter Tight",sans-serif;padding:10px 16px;border-radius:10px;white-space:nowrap}
+.badge.miss{background:#ffe1db;color:#7a1f10}.badge.hit{background:var(--lime);color:#00463c}
+/* exec scene */
+.lbl{font-size:13px;color:var(--mute);margin:0 0 8px}
+.strip{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:18px}
+.tile{width:36px;height:36px;border-radius:6px;display:grid;place-items:center;font:600 13px Inter,sans-serif;background:var(--cell);color:var(--ink);transition:background .5s,color .5s}
+.tile.read{background:var(--coral);color:#3a0d05}
+.tile.cached{background:var(--green2);color:var(--bg)}
+.tile.new{outline:2px dashed var(--coral);outline-offset:2px}
+.tile.chg{outline:2px solid var(--coral);outline-offset:2px}
+.groups{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px;min-height:96px}
+.grp{border-radius:10px;padding:8px;border:2px solid var(--rule);background:var(--panel)}
+.grp .t{font-size:12px;color:var(--mute);margin-bottom:6px;white-space:nowrap}
+.grp .tiles{display:flex;gap:4px}
+.grp .tile{width:30px;height:30px;font-size:12px}
+.grp.co{border-color:var(--coral)}.grp.co .tile{background:var(--coral);color:#3a0d05}
+.grp.re{border-color:var(--green2)}.grp.re .tile{background:var(--green2);color:var(--bg)}
+.grp.br{border-style:dashed;opacity:.5}.grp.br .t{text-decoration:line-through}
+.grp .ps{margin-top:6px;font:12px "JetBrains Mono",monospace;color:var(--mute)}
+.final{border-radius:10px;padding:10px 14px;background:var(--panel);margin-bottom:18px;font-size:15px;min-height:44px}
+.shelf{display:flex;flex-wrap:wrap;gap:6px;min-height:34px}
+.chip{font:12.5px "JetBrains Mono",monospace;padding:5px 10px;border-radius:999px;border:1px solid var(--rule);white-space:nowrap;transition:opacity .5s}
+.chip.fresh{border-color:var(--coral);color:var(--coralink)}
+.chip.used{border-color:var(--green2);color:var(--green2);font-weight:600}
+.chip.gone{text-decoration:line-through;opacity:.45}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--mute);margin-top:14px}
+.sw{display:inline-block;width:13px;height:13px;border-radius:3px;vertical-align:-2px;margin-right:6px}
+.sw.c{background:var(--green2)}.sw.n{background:var(--coral)}.sw.e{background:repeating-linear-gradient(45deg,var(--coral) 0 3px,transparent 3px 6px);border:1px solid var(--coral)}.sw.s{background:var(--skip);border:1px solid var(--rule)}
+/* window scene */
+.fig{position:relative;height:280px}.fig>svg{position:absolute;inset:0;width:100%;height:100%}
+svg text{font:13px Inter,sans-serif;fill:var(--mute);paint-order:stroke;stroke:var(--bg);stroke-width:4px}
+.readout{display:grid;grid-template-columns:repeat(auto-fit,minmax(8em,1fr));gap:8px;margin-top:10px}
+.readout div{background:var(--panel);border-radius:8px;padding:8px 12px;font-size:13px;color:var(--mute)}
+.readout b{display:block;font:700 22px "Inter Tight",sans-serif;color:var(--ink)}
+.pred{font-size:14px;margin:0 0 6px}
+/* store scene */
+.race{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr) minmax(0,1fr);border:1px solid var(--rule);border-radius:10px;overflow:hidden}
+.race .hd{font:600 14px Inter,sans-serif;padding:10px 12px;background:var(--panel);border-bottom:1px solid var(--rule)}
+.race .c{padding:9px 12px;border-bottom:1px solid var(--rule);font-size:14px;min-height:40px}
+.race .c.off{opacity:.12}
+.race .c.now{background:color-mix(in srgb,var(--coral) 14%,transparent)}
+.race .st{font-family:"JetBrains Mono",monospace;font-size:12.5px;color:var(--mute);border-inline:1px solid var(--rule)}
+.ok{color:var(--green2);font-weight:600}.no{color:var(--coralink);font-weight:600}
+.tree{background:var(--panel);border-radius:10px;padding:14px;white-space:pre-wrap;margin:14px 0 0;overflow-wrap:anywhere}
+.tree .gone{text-decoration:line-through;color:var(--mute)}.tree .add{color:var(--green2);font-weight:600}
+/* below */
+.figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(10em,1fr));border-top:1px solid var(--rule);margin-top:18px}
+.figs div{padding:14px 12px 0 0}
+.figs strong{display:block;font:700 clamp(22px,2.4vw,30px) "Inter Tight",sans-serif;color:var(--green2);white-space:nowrap}
+.figs span{font-size:14px;color:var(--mute)}
+.cols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;margin-top:18px}
+.cols h3{font:700 18px "Inter Tight",sans-serif;margin:0 0 6px}
+.cols ul{margin:0;padding-left:18px;color:var(--mute)}.cols li{margin:4px 0}
+.small{font-size:13px;color:var(--mute)}
+@media(max-width:1000px){.plans{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.plans .pl:last-child{grid-column:1/-1}}
+@media(max-width:760px){.hero .lede,.cols{grid-template-columns:minmax(0,1fr)}.plans{grid-template-columns:minmax(0,1fr)}.keyrow{grid-template-columns:minmax(0,1fr)}.stage{padding:12px}}
+@media(max-width:600px){.race{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.race .st{grid-column:1/-1;border-inline:0}.tile{width:30px;height:30px;font-size:12px}.narr .count{margin-left:0}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<section class="band hero">
+<div class="wrap lede">
+  <h1>How the subplan cache turns a repeat query into a memory read</h1>
+  <p>A guided story in seven chapters. It plays by itself and pauses on every step long enough to read. Pause, go back or jump to a chapter whenever you like. Space pauses, and the arrow keys step.</p>
+</div>
+</section>
+
+<section class="band player">
+<div class="wrap">
+  <nav class="rail" id="rail" aria-label="Chapters"></nav>
+  <div class="stage" id="stage">
+    <div class="scene" id="sc-plan">
+      <pre class="sql mono" id="sql"></pre>
+      <div class="plans">
+        <div class="pl"><h3>Optimized logical plan</h3><div id="p-l"></div></div>
+        <div class="pl"><h3>After the cache rewrite</h3><div id="p-r"></div></div>
+        <div class="pl"><h3>Physical plan</h3><div id="p-p"></div></div>
+      </div>
+      <div class="keyrow"><pre class="key mono" id="key" aria-label="Cache key"></pre><div id="badge"></div></div>
+    </div>
+    <div class="scene" id="sc-exec">
+      <p class="lbl" id="x-snap"></p>
+      <div class="strip" id="x-files"></div>
+      <p class="lbl">Segments in this run: UnionExec under the Final aggregate</p>
+      <div class="groups" id="x-groups"></div>
+      <div class="final" id="x-final"></div>
+      <p class="lbl">Cache entries in memory</p>
+      <div class="shelf" id="x-shelf"></div>
+      <div class="legend"><span><i class="sw n"></i>read and computed now</span><span><i class="sw c"></i>partial state from the cache</span></div>
+    </div>
+    <div class="scene" id="sc-win">
+      <p class="pred mono" id="w-pred"></p>
+      <div class="fig"><svg id="w-svg" role="img" aria-label="Files per hour and region, coloured by how the time window classifies them"></svg></div>
+      <div class="legend"><span><i class="sw c"></i>inside, cached state reused</span><span><i class="sw n"></i>inside, computed and stored</span><span><i class="sw e"></i>edge, read live</span><span><i class="sw s"></i>outside, not read</span></div>
+      <div class="readout" id="w-read"></div>
+    </div>
+    <div class="scene" id="sc-store">
+      <div class="race" id="race"></div>
+      <pre class="tree mono" id="r-tree"></pre>
+    </div>
+  </div>
+  <div class="narr" aria-live="polite">
+    <div class="ch" id="n-ch"></div>
+    <p class="cap" id="n-cap"></p>
+    <div class="bar"><i id="n-bar"></i></div>
+    <div class="ctl">
+      <button class="pp" id="n-pp">Pause</button>
+      <button id="n-back">Back</button>
+      <button id="n-next">Next</button>
+      <label for="n-speed">Speed <select id="n-speed"><option value="0.7">Slower</option><option value="1" selected>Normal</option><option value="1.5">Faster</option></select></label>
+      <span class="count" id="n-count"></span>
+    </div>
+  </div>
+  <p class="small">Plans are abridged and ids are illustrative. Timings are from <code>docs/bench/results.json</code> (Delta table, 216 files).</p>
+</div>
+</section>
+
+<section class="band" style="padding-top:0">
+<div class="wrap">
+  <h2>What the bench measured</h2>
+  <div class="figs">
+    <div><strong>829 → 1.3 ms</strong><span>top 10 slowest hours, reusing the rollup</span></div>
+    <div><strong>997 → 88 ms</strong><span>same rollup after appending one hour</span></div>
+    <div><strong>298 → 36 ms</strong><span>last 24 h, filter decided per file</span></div>
+    <div><strong>857 → 9.8 ms</strong><span>new process, entry read from the store</span></div>
+    <div><strong>958 → 1606 ms</strong><span>first run pays to compute and store</span></div>
+  </div>
+  <div class="cols">
+    <div><h3>Whole results</h3><ul><li>Aggregates, joins, windows and DISTINCTs</li><li>Reused under a different ORDER BY, HAVING or LIMIT</li><li>Saved only if every partition finishes</li></ul></div>
+    <div><h3>Per-segment states</h3><ul><li>An aggregate over one file table</li><li>Optionally inner- or semi-joined to static tables</li><li>Needs a two-stage plan and an adapter that can scan a subset of files</li></ul></div>
+    <div><h3>Never cached</h3><ul><li><code>random()</code> and correlated subqueries</li><li>Unregistered tables (policy <code>Skip</code>, <code>Error</code> or <code>AssumeStatic</code>)</li><li>Edge files of a lifted filter</li></ul></div>
+  </div>
+</div>
+</section>
+
+<script>
+{
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ---------- plan data ---------- */
+const AGG=['Aggregate:','groupBy=[[date_trunc(hour, events.ts), events.region]], aggr=[[count(1), avg(events.latency_ms)]]'];
+const SCAN=['TableScan:','events projection=[ts, region, latency_ms]'];
+const KEYTXT='Aggregate: groupBy=[[date_trunc(Utf8("hour"), events.ts), events.region]], aggr=[[count(Int64(1)), avg(events.latency_ms)]] [hour:Timestamp(ns), region:Utf8View, count(Int64(1)):Int64, avg(events.latency_ms):Float64;N]\n  TableScan: events projection=[ts, region, latency_ms] [ts:Timestamp(ns), region:Utf8View, latency_ms:Float64]';
+const SQL1="SELECT date_trunc('hour', ts) AS hour, region,\n       count(*) AS n, avg(latency_ms) AS avg_ms\nFROM events GROUP BY 1, 2 ORDER BY hour";
+const SQL2="WITH hourly AS (… the same rollup …)\nSELECT hour, region, avg_ms FROM hourly\nORDER BY avg_ms DESC LIMIT 10";
+const PLANS={
+ a:{sql:SQL1,
+  L:[['L0',0,'Sort:','hour ASC NULLS LAST'],['L1',1,'Projection:','hour, region, n, avg_ms'],['L2',2,...AGG],['L3',3,...SCAN]],
+  R:[['R0',0,'Sort:','hour ASC'],['R1',1,'Projection:','…'],['R2',2,'CacheWrite:','id=3f9a07c2','cache'],['R3',3,'SegmentedAggregate:','table=events files=16','cache'],['R4',4,'Aggregate:','(original, kept as template)'],['R5',5,'TableScan:','events']],
+  P:[['P0',0,'SortExec:','hour ASC'],['P1',1,'ProjectionExec',''],['P2',2,'CacheWriteExec:','id=3f9a07c2','cache'],['P3',3,'AggregateExec:','mode=FinalPartitioned'],['P4',4,'UnionExec',''],['P5',5,'CacheWriteExec ×4:','one per segment','cache'],['P6',6,'AggregateExec:','mode=Partial','live'],['P7',7,'DataSourceExec:','4 files each','live']]},
+ b:{sql:SQL2,
+  L:[['L0',0,'Sort:','avg_ms DESC, fetch=10'],['L1',1,'Projection:','hour, region, avg_ms'],['L2',2,...AGG],['L3',3,...SCAN]],
+  R:[['R0',0,'Sort:','avg_ms DESC, fetch=10'],['R1',1,'Projection:','…'],['R2',2,'CacheRead:','id=3f9a07c2 rows=216','cache']],
+  P:[['P0',0,'SortExec:','TopK(fetch=10)'],['P1',1,'ProjectionExec',''],['P2',2,'DataSourceExec:','cached batches in memory','cache']]}
+};
+
+/* ---------- state ---------- */
+let st;
+function fresh(){return{scene:'plan',
+  plan:{k:'a',shown:new Set(),born:new Set(),hl:[],keyOn:false,dataOn:false,badge:''},
+  ex:{snap:'',files:[],groups:[],shelf:[],final:'',hl:[]},
+  win:{hours:30,now:30.4,win:6,phase:'none',segs:[],segN:1,last:null},
+  race:0}}
+const P=()=>st.plan;
+function plan(k){st.scene='plan';Object.assign(P(),{k,shown:new Set(),hl:[],keyOn:false,dataOn:false,badge:''})}
+function show(...ids){ids.forEach(i=>{P().shown.add(i);P().born.add(i)})}
+function hl(...ids){P().hl=ids}
+
+/* exec helpers */
+const X=()=>st.ex;
+const tiles=n=>Array.from({length:n},(_,i)=>({id:'f'+(i+1),l:String(i+1),c:''}));
+const grp=(id,ls,kind,ps)=>({id,files:ls,kind,ps});
+function shelf(id,txt,s){const e=X().shelf.find(x=>x.id===id);if(e){e.s=s;return}X().shelf.push({id,txt,s,born:true})}
+function setFiles(fn){X().files.forEach(f=>f.c=fn(f)||'')}
+
+/* window helpers */
+const REG=['EU','US','APAC'];
+const W=()=>st.win;
+function wfiles(){const a=[];for(let h=0;h<W().hours;h++)for(const r of REG)a.push({id:r+'-'+h,h,r});return a}
+function wclass(f){const lo=W().now-W().win;if(f.h+1<=lo)return'out';if(f.h>=lo)return'in';return'edge'}
+function wrun(){
+  const fs=wfiles(),inside=new Set(fs.filter(f=>wclass(f)==='in').map(f=>f.id));
+  const claimed=new Set(),chosen=[];
+  for(const s of [...W().segs].sort((a,b)=>b.files.length-a.files.length))
+    if(s.files.every(id=>inside.has(id)&&!claimed.has(id))){s.files.forEach(id=>claimed.add(id));chosen.push(s)}
+  const missing=fs.filter(f=>inside.has(f.id)&&!claimed.has(f.id)).sort((a,b)=>a.h-b.h),made=[];
+  for(let i=0;i<missing.length;i+=3)made.push({id:'w'+W().segN++,files:missing.slice(i,i+3).map(f=>f.id)});
+  W().segs.push(...made);
+  const state=new Map(fs.map(f=>[f.id,wclass(f)]));
+  chosen.forEach(s=>s.files.forEach(id=>state.set(id,'re')));
+  made.forEach(s=>s.files.forEach(id=>state.set(id,'co')));
+  W().last={state,re:chosen.reduce((n,s)=>n+s.files.length,0),co:missing.length,edge:fs.filter(f=>wclass(f)==='edge').length,out:fs.filter(f=>wclass(f)==='out').length,n:fs.length};
+  W().phase='run';
+}
+
+/* ---------- the story ---------- */
+const CH=['The query','Running it','A different query','New files arrive','A file is rewritten','A sliding window','Sharing a store'];
+const S=[
+ [0,'A dashboard asks for an hourly rollup: the row count and average latency per hour and region, from a table called events. That table is 16 immutable Parquet files, registered with the cache.',()=>{plan('a')}],
+ [0,'DataFusion parses and optimizes the SQL into a logical plan. Read it from the bottom up: scan events, aggregate by hour and region, project the columns, then sort.',()=>{show('L0','L1','L2','L3')}],
+ [0,'The cache plugs in as the session’s query planner, so it gets this optimized plan before any execution is planned. It walks it from the top, looking for subtrees worth storing: aggregates, joins, windows and DISTINCTs.',()=>{hl('L0')}],
+ [0,'A Sort is not one of those, so it is copied over as it is, and the walk moves down to its input.',()=>{show('R0');hl('L0','R0')}],
+ [0,'The Projection is not one either. Copied over, keep going down.',()=>{show('R1');hl('L1','R1')}],
+ [0,'The Aggregate is where the work is. The cache builds its key, starting from the plan text of this subtree, exactly as DataFusion prints it with its schema.',()=>{hl('L2','L3');P().keyOn=true}],
+ [0,'The key also needs the identity of the data the subtree reads: the table name and a hash of its 16 file ids. Same text over the same files means the same answer.',()=>{P().dataOn=true;hl('L2','L3')}],
+ [0,'The cache looks the key up. Nothing has been stored yet, so it is a miss.',()=>{P().badge='miss'}],
+ [0,'This aggregate reads one file table, so the cache plans it as a SegmentedAggregate. Besides the final answer, it will keep a partial result for each group of files.',()=>{show('R3','R4','R5');hl('R3')}],
+ [0,'It also wraps the subtree in a CacheWrite node, so the final answer gets saved under the full key.',()=>{show('R2');hl('R2')}],
+ [0,'The physical planner turns this into operators. The Final aggregate sits on top. Under it is a union of Partial aggregates, one per segment of files, each behind a CacheWriteExec.',()=>{show('P0','P1','P2','P3','P4','P5','P6','P7');hl('P4','P5','P6','P7')}],
+
+ [1,'Here are the 16 files of snapshot v1. Each has a stable id. With Delta or DuckLake that id is the file path plus any delete files that apply to it.',()=>{st.scene='exec';Object.assign(X(),{snap:'events · snapshot v1 · 16 files',files:tiles(16),groups:[],shelf:[],final:''})}],
+ [1,'segment_files is 4, so the files are split into 4 segments of 4 files each.',()=>{X().groups=[grp('seg01',['1','2','3','4'],''),grp('seg02',['5','6','7','8'],''),grp('seg03',['9','10','11','12'],''),grp('seg04',['13','14','15','16'],'')]}],
+ [1,'Each segment gets its own scan and a Partial aggregate. A partial state is small: for each hour and region, a running count and sum, not the raw rows.',()=>{setFiles(()=>'read');X().groups.forEach(g=>{g.kind='co';g.ps='Partial → count, sum per group'})}],
+ [1,'CacheWriteExec passes those states through unchanged and keeps a copy. The copy becomes a cache entry only after every partition finishes, so a query that stops early never stores half a result.',()=>{X().groups.forEach(g=>shelf(g.id,g.id+' · 4 files','fresh'))}],
+ [1,'The Final aggregate merges the four partial states into 216 rows, one per hour and region. That answer is saved too, as one more entry under the whole-plan key.',()=>{X().final='Final aggregate: 4 partial states merged → 216 rows';shelf('3f9a','3f9a07c2 · whole result','fresh')}],
+ [1,'This first run is slower than plain DataFusion: 1.6 s against 0.96 s in the bench. It works in segments and writes everything out. That cost is paid once.',()=>{setFiles(()=>'cached');X().groups.forEach(g=>g.kind='re');X().shelf.forEach(e=>e.s='')}],
+
+ [2,'Next, someone asks for the ten slowest hours. The SQL is different, with its own sort and LIMIT on top.',()=>{plan('b');show('L0','L1','L2','L3')}],
+ [2,'Once optimized, the Aggregate underneath is the same text over the same 16 files, so it has the same key.',()=>{show('R0','R1');hl('L2','L3');P().keyOn=true;P().dataOn=true}],
+ [2,'A hit. The whole subtree, scan included, is replaced by a single CacheRead leaf. It has the same schema, so the nodes above it don’t notice the change.',()=>{P().badge='hit';show('R2');hl('R2')}],
+ [2,'Execution reads 216 rows from memory and sorts them. In the bench, 829 ms became 1.3 ms.',()=>{show('P0','P1','P2');hl('P2')}],
+
+ [3,'An ingest job commits 3 new files. cache.refresh() picks up snapshot v2, which has 19 files. Back to the original rollup query.',()=>{st.scene='exec';const x=X();x.snap='events · snapshot v2 · 19 files';x.files.push(...[17,18,19].map(n=>({id:'f'+n,l:String(n),c:'new'})));x.groups=[];x.final='';x.shelf.forEach(e=>e.s='')}],
+ [3,'The whole-result entry was keyed to v1’s set of files, and v1 is no longer current, so that entry is dropped from memory. In the shared store it stays until a purge.',()=>{shelf('3f9a','','gone')}],
+ [3,'Segment entries are keyed differently: the aggregate’s plan text plus their own 4 file ids, with no snapshot in the key. All 16 of those files are still in v2, so all 4 segments are reused.',()=>{const x=X();x.groups=['seg01','seg02','seg03','seg04'].map((id,i)=>grp(id,[1,2,3,4].map(n=>String(n+i*4)),'re','from memory'));x.shelf.forEach(e=>{if(e.id.startsWith('seg'))e.s='used'});setFiles(f=>+f.l<=16?'cached':'new')}],
+ [3,'Only the 3 new files are scanned. They form one new segment, and its partial state is stored.',()=>{X().groups.push(grp('seg05',['17','18','19'],'co','Partial → stored'));setFiles(f=>+f.l<=16?'cached':'read');shelf('seg05','seg05 · 3 files','fresh')}],
+ [3,'The Final aggregate merges 5 partial states. In the bench, 997 ms became 88 ms. The work grows with what changed, not with the table size.',()=>{X().final='Final aggregate: 5 partial states merged → 219 rows';shelf('71d0','71d0e5ab · whole result','fresh')}],
+
+ [4,'Now a DELETE removes some rows from file 6. Delta records that as a deletion vector, and the adapter puts it into the file’s id. To the cache, file 6 is now a new file, 6′.',()=>{const x=X();x.snap='events · snapshot v3 · 19 files';x.groups=[];x.final='';x.shelf.forEach(e=>e.s=e.s==='gone'?'gone':'');x.shelf=x.shelf.filter(e=>e.id!=='3f9a');shelf('71d0','','gone');setFiles(f=>f.l==='6'?'chg':'cached');x.files.find(f=>f.l==='6').l='6′'}],
+ [4,'Segment seg02 held files 5, 6, 7 and 8. One of its files is no longer in the snapshot, so the whole segment is dropped.',()=>{X().groups=[grp('seg02',['5','6','7','8'],'br','file 6 changed')];shelf('seg02','','gone')}],
+ [4,'Files 5, 7 and 8 did not change, but their states were stored together with file 6’s. So all four are read again and stored as a new segment. The other segments are reused.',()=>{const x=X();x.groups=[grp('seg01',['1','2','3','4'],'re','from memory'),grp('seg06',['5','6′','7','8'],'co','Partial → stored'),grp('seg03',['9','10','11','12'],'re','from memory'),grp('seg04',['13','14','15','16'],'re','from memory'),grp('seg05',['17','18','19'],'re','from memory')];setFiles(f=>['5','6′','7','8'].includes(f.l)?'read':'cached');x.shelf.forEach(e=>{if(e.s!=='gone')e.s='used'});shelf('seg06','seg06 · 4 files','fresh')}],
+ [4,'That is the tradeoff behind segment_files. Smaller segments mean less rework when a file changes, but more cache entries. For tables that change often, use small segments.',()=>{X().final='Final aggregate: 5 partial states merged → 219 rows'}],
+
+ [5,'Dashboards often ask for recent data, like WHERE ts >= now() - interval \'6 hours\'. DataFusion turns now() into a fixed timestamp, so the plan text, and the key, are different on every run.',()=>{st.scene='win';W().phase='none'}],
+ [5,'This events table has one file per hour for each of 3 regions. The table’s statistics give each file’s minimum and maximum ts, so the cache doesn’t have to read any file to know them.',()=>{W().phase='files'}],
+ [5,'So the cache takes the ts filter out of the key and decides it per file instead. The aggregate is keyed without the filter, and that key stays the same from one run to the next.',()=>{W().phase='window'}],
+ [5,'Files that end before the window starts are outside. Nothing in them can match, so they are never read.',()=>{W().phase='out'}],
+ [5,'Files the window boundary cuts through are edge files. They are read live with the full filter and never cached, because their answer depends on exactly where the boundary falls.',()=>{W().phase='edge'}],
+ [5,'Every row of a file fully inside the window counts, so its unfiltered partial state is exactly what is needed. On the first run, those files are computed, grouped by hour, and stored.',()=>{wrun()}],
+ [5,'An hour later, the window has moved and a new hour of files has landed. The new files are computed. The rest of the window comes from the cache.',()=>{W().hours++;W().now++;wrun()}],
+ [5,'And again an hour after that. Each run reads only the newest hour plus the edge, not the whole window.',()=>{W().hours++;W().now++;wrun()}],
+ [5,'A filter is lifted only if it leaves at most 25% of the files as edge files. A filter like amount > 100 would cut through every file, so it stays in the key instead.',()=>{}],
+
+ [6,'Entries also go to a shared store, which can be a directory, S3 or GCS. Two processes, A and B, run the same rollup at the same moment. Both miss.',()=>{st.scene='store';st.race=1}],
+ [6,'Each one writes its result’s Arrow data file under its own random writer id, so the two writes cannot collide.',()=>{st.race=3}],
+ [6,'A then writes the manifest with a create-only put. It is the first, so the put succeeds, and the entry now exists.',()=>{st.race=4}],
+ [6,'B’s create-only put fails with 412 Precondition Failed: someone got there first. No locks were involved.',()=>{st.race=5}],
+ [6,'B deletes its own data file and uses A’s manifest. Both processes now point at the same data.',()=>{st.race=6}],
+ [6,'Later, process C starts with an empty cache. It lists the manifests, finds the entry, and fetches the data only when a query needs it. In the bench, 857 ms became 9.8 ms. That’s the whole story.',()=>{st.race=7}]
+];
+
+/* ---------- renderers ---------- */
+let cur=0;
+const node=([id,d,name,rest,k])=>{const p=P();const h=p.hl.includes(id)?' hl':'';const b=p.bornNow.has(id)?' born':'';return `<div class="nd ${d?'dep':''} ${k||''}${h}${b}" style="--d:${d}"><b>${esc(name)}</b> <i>${esc(rest)}</i></div>`};
+function rPlan(){
+  const p=P(),d=PLANS[p.k],vis=n=>p.shown.has(n[0]);
+  $('sql').textContent=d.sql;
+  $('p-l').innerHTML=d.L.filter(vis).map(node).join('');
+  $('p-r').innerHTML=d.R.filter(vis).map(node).join('');
+  $('p-p').innerHTML=d.P.filter(vis).map(node).join('');
+  $('key').innerHTML=p.keyOn?esc(KEYTXT)+(p.dataOn?'\n<span class="data">-- data: events@a41c9e07d2b35f18</span>':''):'<span style="opacity:.6">cache key: not built yet</span>';
+  $('badge').innerHTML=p.badge?`<div class="badge ${p.badge} born">${p.badge==='hit'?'Hit':'Miss'}</div>`:'';
+}
+function rExec(){
+  const x=X();
+  $('x-snap').textContent=x.snap;
+  $('x-files').innerHTML=x.files.map(f=>`<span class="tile ${f.c}">${esc(f.l)}</span>`).join('');
+  $('x-groups').innerHTML=x.groups.length?x.groups.map(g=>`<div class="grp ${g.kind} born"><div class="t">${esc(g.id)}</div><div class="tiles">${g.files.map(l=>`<span class="tile">${esc(l)}</span>`).join('')}</div>${g.ps?`<div class="ps">${esc(g.ps)}</div>`:''}</div>`).join(''):'<span class="small">No query running.</span>';
+  $('x-final').textContent=x.final||'Final aggregate: waiting for partial states';
+  $('x-shelf').innerHTML=x.shelf.length?x.shelf.map(e=>`<span class="chip ${e.s}">${esc(e.txt)}</span>`).join(''):'<span class="small">Empty</span>';
+}
+const svg=$('w-svg');
+function rWin(){
+  const w=W(),ph=w.phase,Wd=svg.clientWidth,H=svg.clientHeight;if(!Wd)return;
+  const L=Wd<520?44:56,R=12,T=34,B=34,showN=Math.min(Wd<520?16:24,w.hours);
+  const h0=w.hours-showN,cw=(Wd-L-R)/(showN+1),rh=(H-T-B)/3,pad=Math.max(1.5,cw*.12),x=h=>L+(h-h0)*cw;
+  const lo=w.now-w.win,wx=Math.max(L,x(lo)),wx2=x(w.now);
+  const hasWin=!['none','files'].includes(ph);
+  let o='<defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="3" height="6" fill="var(--coral)"/></pattern></defs>';
+  if(hasWin)o+=`<rect x="${wx}" y="${T-8}" width="${wx2-wx}" height="${H-T-B+16}" fill="var(--lime)" opacity=".5" rx="6"/>`;
+  REG.forEach((r,i)=>{o+=`<text x="${L-8}" y="${T+i*rh+rh/2+4}" text-anchor="end">${r}</text>`});
+  for(let h=h0;h<w.hours;h++)for(let i=0;i<3;i++){
+    const f={h,r:REG[i]},c=wclass(f);
+    let st2='plain';
+    if(ph==='run')st2=w.last.state.get(REG[i]+'-'+h);
+    else if(ph==='out')st2=c==='out'?'out':'plain';
+    else if(ph==='edge')st2=c==='in'?'plain':c;
+    const fill=st2==='re'?'var(--green2)':st2==='co'?'var(--coral)':st2==='edge'?'url(#hatch)':st2==='out'?'var(--skip)':'var(--cell)';
+    const op=ph==='none'?.35:1;
+    o+=`<rect x="${x(h)+pad/2}" y="${T+i*rh+pad/2}" width="${cw-pad}" height="${rh-pad}" rx="3" fill="${fill}" opacity="${op}" stroke="${st2==='edge'?'var(--coral)':st2==='out'?'var(--rule)':'none'}"/>`;
+  }
+  const every=Wd<520?6:3;
+  for(let h=h0;h<=w.hours;h++)if(h%every===0)o+=`<text x="${x(h)}" y="${H-12}" text-anchor="middle">${String(h%24).padStart(2,'0')}:00</text>`;
+  o+=`<line x1="${wx2}" x2="${wx2}" y1="${T-14}" y2="${H-B+6}" stroke="var(--ink)" stroke-width="2"/><text x="${wx2}" y="${T-18}" text-anchor="end" style="fill:var(--ink)">now() ${String(w.hours%24).padStart(2,'0')}:24</text>`;
+  if(hasWin&&wx>L+80)o+=`<text x="${wx-6}" y="${T-18}" text-anchor="end">now() − ${w.win}h</text>`;
+  svg.innerHTML=o;
+  $('w-pred').textContent=hasWin?'Key: aggregate without the filter. Lifted: ts >= now() - 6h, decided per file':"WHERE ts >= now() - interval '6 hours'   →   ts >= TIMESTAMP '…"+String(w.hours%24).padStart(2,'0')+":24' - 6h";
+  const l=w.last,fs=w.hours*3;
+  const cells=ph==='run'?[['reused from cache',l.re],['computed and stored',l.co],['edge, read live',l.edge],['outside, not read',l.out]]:[['files in snapshot',fs],['edge, read live',['edge','run'].includes(ph)?wfiles().filter(f=>wclass(f)==='edge').length:'–'],['outside, not read',['out','edge'].includes(ph)?wfiles().filter(f=>wclass(f)==='out').length:'–']];
+  $('w-read').innerHTML=cells.map(([k,v])=>`<div><b>${v}</b>${k}</div>`).join('');
+}
+const wro=new ResizeObserver(()=>{if(st.scene==='win')rWin()});wro.observe(svg);
+const RS=[
+ ['miss → computes the rollup','','miss → computes the same rollup'],
+ ['PUT …/3f9a…-a71f.arrow','<span class="ok">201</span> data file from A',''],
+ ['','<span class="ok">201</span> data file from B','PUT …/3f9a…-0b3d.arrow'],
+ ['PUT 3f9a….json  If-None-Match: *','<span class="ok">201 created</span>: the entry exists',''],
+ ['','<span class="no">412 Precondition Failed</span>','PUT 3f9a….json  If-None-Match: *'],
+ ['','DELETE …-0b3d.arrow','deletes its file, adopts A’s manifest'],
+ ['Process C starts: LIST manifests → 1 entry','GET …-a71f.arrow when a query needs it','']
+];
+const TREES=[[],[],['a'],['a','b'],['a','b','m'],['a','b','m'],['a','B','m'],['a','m']];
+function rStore(){
+  const ri=st.race;
+  let h='<div class="hd">Process A</div><div class="hd">Store</div><div class="hd">Process B</div>';
+  RS.forEach((r,i)=>{const c=i<ri?(i===ri-1||(ri===3&&i===1)?'now':''):'off';h+=`<div class="c ${c}">${r[0]}</div><div class="c st ${c}">${r[1]}</div><div class="c ${c}">${r[2]}</div>`});
+  $('race').innerHTML=h;
+  const t=TREES[ri]||[],ln=(on,cls,txt)=>on?`<span class="${cls}">${txt}</span>\n`:'';
+  $('r-tree').innerHTML='gs://bucket/plan-cache/v3-df55.2.0/results/\n'+ln(t.includes('a'),'add','  3f9a07c2…-a71f.arrow')+ln(t.includes('b'),'add','  3f9a07c2…-0b3d.arrow')+ln(t.includes('B'),'gone','  3f9a07c2…-0b3d.arrow')+ln(t.includes('m'),'add','  3f9a07c2….json   data_file: -a71f.arrow')+(t.length?'':'  (empty)\n')+'gs://bucket/plan-cache/v3-df55.2.0/segments/b81e44d0…/\n  one manifest + data file per segment, same rules';
+}
+
+/* ---------- player ---------- */
+$('rail').innerHTML=CH.map((c,i)=>`<button data-c="${i}">${i+1} · ${c}</button>`).join('');
+let playing=!reduce,t0=0,dur=1,raf=0;
+function go(i,anim=true){
+  cur=Math.max(0,Math.min(S.length-1,i));
+  st=fresh();
+  for(let j=0;j<=cur;j++){if(j===cur)P().born=new Set();P().hl=[];X().hl=[];S[j][2]()}
+  P().bornNow=anim?P().born:new Set();
+  const sc=st.scene;
+  for(const [k,id] of [['plan','sc-plan'],['exec','sc-exec'],['win','sc-win'],['store','sc-store']]){const el=$(id),on=k===sc;if(on&&!el.classList.contains('on'))el.classList.add('on');if(!on)el.classList.remove('on')}
+  ({plan:rPlan,exec:rExec,win:rWin,store:rStore})[sc]();
+  const ch=S[cur][0];
+  $('n-ch').textContent=`Chapter ${ch+1} of ${CH.length} · ${CH[ch]}`;
+  const cap=$('n-cap');cap.textContent=S[cur][1];cap.classList.remove('new');void cap.offsetWidth;cap.classList.add('new');
+  $('n-count').textContent=`Step ${cur+1} of ${S.length}`;
+  document.querySelectorAll('#rail button').forEach(b=>{const c=+b.dataset.c;b.classList.toggle('on',c===ch);b.classList.toggle('done',c<ch)});
+  dur=Math.max(6000,S[cur][1].length*58)/(+$('n-speed').value);t0=performance.now();
+  $('n-bar').style.width='0';
+  setPP();
+}
+function setPP(){$('n-pp').textContent=playing?'Pause':cur>=S.length-1?'Replay':'Play'}
+function tick(now){
+  if(playing){
+    const f=Math.min(1,(now-t0)/dur);$('n-bar').style.width=(f*100)+'%';
+    if(f>=1){if(cur<S.length-1)go(cur+1);else{playing=false;setPP()}}
+  }
+  raf=requestAnimationFrame(tick);
+}
+$('n-pp').addEventListener('click',()=>{
+  if(!playing&&cur>=S.length-1){playing=true;go(0);return}
+  playing=!playing;if(playing)t0=performance.now()-(parseFloat($('n-bar').style.width)||0)/100*dur;setPP();
+});
+$('n-next').addEventListener('click',()=>go(cur+1));
+$('n-back').addEventListener('click',()=>go(cur-1));
+$('n-speed').addEventListener('change',()=>{dur=Math.max(6000,S[cur][1].length*58)/(+$('n-speed').value)});
+$('rail').addEventListener('click',e=>{const b=e.target.closest('button');if(b)go(S.findIndex(s=>s[0]===+b.dataset.c))});
+document.addEventListener('keydown',e=>{
+  if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return;
+  if(e.key===' '&&e.target.tagName!=='BUTTON'){e.preventDefault();$('n-pp').click()}
+  else if(e.key==='ArrowRight')go(cur+1);else if(e.key==='ArrowLeft')go(cur-1);
+});
+go(0);raf=requestAnimationFrame(tick);
+}
+</script>
+</body>
+</html>

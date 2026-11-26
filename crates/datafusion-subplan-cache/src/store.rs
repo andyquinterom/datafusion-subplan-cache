@@ -45,8 +45,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::ipc::CompressionType;
-use datafusion::arrow::ipc::reader::FileReader;
-use datafusion::arrow::ipc::writer::{FileWriter, IpcWriteOptions};
+use datafusion::arrow::ipc::reader::{FileReader, StreamReader};
+use datafusion::arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use datafusion::common::{DataFusionError, Result};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
@@ -178,7 +178,10 @@ impl PersistentStore {
     /// manifest, create-only.
     pub async fn put(&self, m: &Manifest, data: &EntryData) -> Result<Put> {
         let options = IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?;
-        let mut writer = FileWriter::try_new_with_options(Vec::new(), &data.schema, options)?;
+        // The stream format, unlike the file format, allows a dictionary to
+        // be replaced between batches (e.g. dictionary-encoded partition
+        // columns of a Delta table, one dictionary per file).
+        let mut writer = StreamWriter::try_new_with_options(Vec::new(), &data.schema, options)?;
         for batch in data.partitions.iter().flatten() {
             writer.write(batch)?;
         }
@@ -272,9 +275,14 @@ impl PersistentStore {
             Err(e) => return Err(oe(e)),
         };
         trace("GET data", t);
-        let reader = FileReader::try_new(Cursor::new(bytes), None)?;
-        let schema = reader.schema();
-        let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>()?;
+        // Entries written by earlier versions use the IPC file format.
+        let (schema, batches): (_, Vec<RecordBatch>) = if bytes.starts_with(b"ARROW1") {
+            let reader = FileReader::try_new(Cursor::new(bytes), None)?;
+            (reader.schema(), reader.collect::<Result<_, _>>()?)
+        } else {
+            let reader = StreamReader::try_new(Cursor::new(bytes), None)?;
+            (reader.schema(), reader.collect::<Result<_, _>>()?)
+        };
         let mut it = batches.into_iter();
         let partitions = m.partition_batches.iter().map(|n| it.by_ref().take(*n).collect()).collect();
         Ok(Some(EntryData { schema, partitions }))

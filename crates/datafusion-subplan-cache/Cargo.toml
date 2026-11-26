@@ -41,3 +41,7 @@ required-features = ["delta"]
 [[example]]
 name = "quickstart_ducklake"
 required-features = ["ducklake"]
+
+[[example]]
+name = "bench"
+required-features = ["delta", "ducklake"]

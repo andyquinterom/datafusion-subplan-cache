@@ -259,6 +259,41 @@ async fn delta_delete_recomputes_only_the_rewritten_file() -> Result<()> {
     Ok(())
 }
 
+/// Delta partition columns come back dictionary-encoded, one dictionary per
+/// file: a cached result over several files must still persist and load.
+#[cfg(feature = "delta")]
+#[tokio::test]
+async fn delta_partitioned_entries_persist() -> Result<()> {
+    use datafusion_subplan_cache::DeltaSource;
+    use deltalake::DeltaTable;
+    use deltalake::protocol::SaveMode;
+    let de = |e: deltalake::DeltaTableError| datafusion_subplan_cache::datafusion::common::DataFusionError::External(Box::new(e));
+
+    let dir = temp_dir("delta-part");
+    let url = url::Url::from_directory_path(&dir).unwrap();
+    let plain = SessionContext::new();
+    let mut table = DeltaTable::try_from_url(url.clone()).await.map_err(de)?;
+    for n in 0..3 {
+        let sql = format!("SELECT 'p{n}' AS part, value % 10 AS k, value AS v FROM range({}, {})", n * 1000, (n + 1) * 1000);
+        let b = plain.sql(&sql).await?.collect().await?;
+        table = table.write(b).with_save_mode(SaveMode::Append).with_partition_columns(["part"]).await.map_err(de)?;
+    }
+    const BY_PART: &str = "SELECT part, k, sum(v) AS s FROM facts GROUP BY part, k ORDER BY part, k";
+    let store = Arc::new(PersistentStore::open(temp_dir("delta-part-store").to_str().unwrap())?);
+    let mut hits = vec![];
+    for _ in 0..2 {
+        // Two "processes" sharing one store.
+        let cache = SubplanCache::builder().segment_files(1).with_store(store.clone()).build();
+        let ctx = cache.session_context();
+        cache.register_table(&ctx, "facts", DeltaSource::open(url.as_str()).await?).await?;
+        let f = Fixture { cache, ctx, facts: dir.clone() };
+        hits.push(run(&f, BY_PART).await?.hits.len());
+        assert_eq!(f.cache.loads(), hits.len() - 1);
+    }
+    assert_eq!(hits, [0, 1]);
+    Ok(())
+}
+
 /// A SQLite-backed DuckLake in a temp dir with table `main.facts` written in
 /// `files` INSERTs of 1000 rows each (one Parquet file each). Returns the
 /// writer session (catalog `lake`) and the catalog connection string.
